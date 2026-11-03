@@ -8,7 +8,6 @@
  *   FULL_HOUSE — every number on the card marked (90-ball full house / 75-ball blackout)
  */
 import { GridCells, gridSpec } from "./variants";
-import { daubMask } from "./cards";
 
 export type PatternPayload =
   | { kind: "CELLS"; cells: Array<[number, number]> }
