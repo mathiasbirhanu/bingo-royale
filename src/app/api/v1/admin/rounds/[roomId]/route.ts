@@ -14,16 +14,20 @@ import { generateDrawSequence, openSealedSeed } from "@/modules/game-core/draw";
  *   POST { action: "set-speed", ballIntervalMs }   → live caller speed (500–20000 ms);
  *                                                    the engine reads the room row every
  *                                                    tick, so the very next ball uses it.
+ *   POST { action: "set-price", priceSantim }      → card price while selling (owner-set);
+ *                                                    takes effect on the next purchase.
  *   POST { action: "set-claim-mode", autoClaim }   → auto-pay vs manual BINGO! claims.
  * Completed rounds get their report persisted here so the report page can
  * render reveal data (FR-GAME-07).
  */
 
 const LIVE_STATUSES = ["SCHEDULED", "SALES_OPEN", "LOCKED", "DRAWING"];
+const SELLING_STATUSES = ["SCHEDULED", "SALES_OPEN"];
 
 const bodySchema = z.discriminatedUnion("action", [
   z.object({ action: z.literal("void"), reasonCode: z.string().min(3).max(64) }),
   z.object({ action: z.literal("set-speed"), ballIntervalMs: z.number().int().min(500).max(20000) }),
+  z.object({ action: z.literal("set-price"), priceSantim: z.number().int().min(50).max(500000) }),
   z.object({ action: z.literal("set-claim-mode"), autoClaim: z.boolean() }),
 ]);
 
@@ -52,6 +56,24 @@ export const POST = route(
 
     if (!LIVE_STATUSES.includes(room.status)) {
       throw new ApiError("VALIDATION_FAILED", `round is ${room.status} — only live rounds can be tuned`);
+    }
+
+    if (input.action === "set-price") {
+      if (!SELLING_STATUSES.includes(room.status)) {
+        throw new ApiError("VALIDATION_FAILED", `round is ${room.status} — card price can only change while selling`);
+      }
+      await db.room.update({ where: { id: room.id }, data: { priceSantim: BigInt(input.priceSantim) } });
+      await auditTx(db, {
+        actorId: user!.id,
+        actorRole: user!.role,
+        tenantId: room.tenantId,
+        action: "ROUND_PRICE_SET",
+        entityType: "Room",
+        entityId: room.id,
+        meta: { from: room.priceSantim.toString(), to: String(input.priceSantim) },
+      });
+      console.log(`[admin] ${room.title} card price → ${input.priceSantim}santim`);
+      return jsonOk({ priceSantim: String(input.priceSantim), status: room.status });
     }
 
     if (input.action === "set-speed") {
@@ -148,6 +170,10 @@ export const GET = route(
       ballsTotal: gridSpec(room.variantId).ballsTotal,
       calledBalls: balls.map((b) => ({ seq: b.seq, ball: b.ball })),
       drawOrder,
+      // fairness proof (owner-only): the commitment published at lock and the
+      // input hash that binds the exact award inputs (revealed at completion).
+      commitment: seal?.commitment ?? null,
+      hash: seal?.inputHash ?? null,
       report: report ? JSON.parse(report.payloadJson) : null,
     });
   },
