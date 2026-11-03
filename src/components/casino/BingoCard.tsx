@@ -1,19 +1,23 @@
 "use client";
 
 /**
- * BingoCard — one ticket for both variants, two marking modes:
- *   · auto — server-driven daub state (ADR-20), a pure function of the called set;
- *   · manual (tap-to-daub) — the player taps each called number; invalid taps
- *     buzz + shake and mark nothing. The server still validates every claim
- *     against the called set, so manual marking is engagement, not trust.
+ * BingoCard — one ticket, PER-CARD manual play (the owner's rule):
+ *   · tapping a number marks THIS card only — the same number on another
+ *     card stays empty until the player finds and taps it there too;
+ *   · a called-but-undaubed cell glows gold (the find-me hint);
+ *   · tapping a number that has NOT been called buzzes + shakes red and
+ *     marks nothing (real-money safe);
+ *   · the per-card BINGO! button arms when THIS card completes an open
+ *     pattern with its own daubs; a failed claim flashes "NOT YET!", locks
+ *     the button for 3 seconds (anti-spam) and the server re-validates
+ *     every claim — manual marking is the game, never the trust.
  *
  * The same cells render 5×5 (75-ball, FREE centre) and 3×9 (90-ball strip).
  * 75-ball column headers carry the classic per-letter colours (B crimson,
  * I gold, N emerald, G bronze, O rose) — the Royale warm palette.
  */
-import { memo } from "react";
-import { Star } from "lucide-react";
-import { ballClass } from "@/lib/client/types";
+import { memo, useEffect, useState } from "react";
+import { Loader2, Star } from "lucide-react";
 
 /** Warm header colours — no blue, matches the THEMES palette. */
 const LETTER_COLORS = [
@@ -27,31 +31,61 @@ const LETTER_COLORS = [
 interface Props {
   cells: (number | null)[][];
   variantId: string;
-  /** Marked ball numbers (auto: called set · manual: player's daubs). */
-  marked: Set<number>;
-  freshBall: number | null;
-  /** Manual mode: cells are tappable. */
+  /** Balls called so far (server truth — drives hints + tap validity). */
+  called: ReadonlySet<number>;
+  /** THIS card's daubs only — per-card manual marking, never shared. */
+  daubed: ReadonlySet<number>;
+  /** Last number daubed on THIS card (fresh-pop animation). */
+  fresh: number | null;
+  /** Manual mode: cells are tappable and the find-me hint glows. */
   interactive?: boolean;
   onTapCell?: (n: number) => void;
-  /** Invalid-tap feedback: { n, k } — k re-triggers the shake animation. */
+  /** Invalid-tap feedback on this card: { n, k } — k re-triggers the shake. */
   shake?: { n: number; k: number } | null;
+  /** Brief red "NOT YET!" flash after this card's claim failed. */
+  notYet?: boolean;
+  /** Render the per-card BINGO! claim button (manual rooms, while drawing). */
+  showBingo?: boolean;
+  /** THIS card completed an open pattern with its own daubs. */
+  bingo?: boolean;
+  claiming?: boolean;
+  /** Epoch ms until which the button stays locked after a failed claim. */
+  lockUntil?: number | null;
+  onClaim?: () => void;
   compact?: boolean;
 }
 
 export const BingoCard = memo(function BingoCard({
   cells,
   variantId,
-  marked,
-  freshBall,
+  called,
+  daubed,
+  fresh,
   interactive = false,
   onTapCell,
   shake,
+  notYet = false,
+  showBingo = false,
+  bingo = false,
+  claiming = false,
+  lockUntil = null,
+  onClaim,
   compact,
 }: Props) {
   const is75 = variantId === "BALL_75";
   const cols = is75 ? 5 : 9;
   const headers = is75 ? ["B", "I", "N", "G", "O"] : Array.from({ length: 9 }, (_, i) => (i + 1).toString());
   const shakeK = shake?.k ?? 0;
+
+  // Lock countdown — ticks only while a lock is active. No synchronous
+  // setState: the interval corrects the countdown within 250ms of arming.
+  const [now, setNow] = useState(() => (typeof window === "undefined" ? 0 : Date.now()));
+  useEffect(() => {
+    if (!lockUntil) return;
+    const t = setInterval(() => setNow(Date.now()), 250);
+    return () => clearInterval(t);
+  }, [lockUntil]);
+  const locked = !!lockUntil && lockUntil > now;
 
   return (
     <div className={`gold-frame rounded-xl bg-card/90 overflow-hidden ${compact ? "p-1.5" : "p-2.5"}`}>
@@ -76,16 +110,20 @@ export const BingoCard = memo(function BingoCard({
         <div key={r} className="grid gap-1 mb-1 last:mb-0" style={{ gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))` }}>
           {row.map((n, c) => {
             const isFree = n === null && is75 && r === 2 && c === 2;
-            const cellMarked = isFree || (n !== null && marked.has(n));
-            const fresh = n !== null && cellMarked && n === freshBall;
+            const cellMarked = isFree || (n !== null && daubed.has(n));
+            // The find-me hint: the ball was called but THIS card's cell was
+            // not tapped yet — a gold pulse ring invites the tap.
+            const hinted = !cellMarked && n !== null && called.has(n);
+            const freshCell = n !== null && cellMarked && n === fresh;
             const shaking = n !== null && shake?.n === n;
             const cell = (
               <div
                 key={c}
                 className={`relative flex items-center justify-center rounded-md select-none transition-shadow
                   ${compact ? "h-8 text-[13px]" : "h-10 text-[15px]"}
-                  ${shaking ? "cell-shake" : ""}
-                  ${fresh ? "cell-fresh" : ""}
+                  ${shaking ? "cell-shake cell-buzz" : ""}
+                  ${freshCell ? "cell-fresh" : ""}
+                  ${hinted ? "cell-glow" : ""}
                   ${n === null
                     ? isFree
                       ? "bg-primary/15 text-primary"
@@ -93,7 +131,7 @@ export const BingoCard = memo(function BingoCard({
                     : cellMarked
                       ? "bg-background/25 text-transparent"
                       : "bg-secondary/70 text-foreground font-bold"}`}
-                aria-label={n === null ? (isFree ? "free square" : "blank") : cellMarked ? `${n} marked` : String(n)}
+                aria-label={n === null ? (isFree ? "free square" : "blank") : cellMarked ? `${n} marked` : hinted ? `${n} called — tap to daub` : String(n)}
               >
                 {n === null ? (
                   isFree ? <Star className={compact ? "w-3.5 h-3.5" : "w-4 h-4"} fill="currentColor" />
@@ -101,7 +139,7 @@ export const BingoCard = memo(function BingoCard({
                 ) : (
                   <>
                     <span className={cellMarked ? "opacity-30" : ""}>{n}</span>
-                    {cellMarked && <span className={`daub ${fresh ? "" : "animate-none"}`} />}
+                    {cellMarked && <span className={`daub ${freshCell ? "" : "animate-none"}`} />}
                   </>
                 )}
                 {n !== null && cellMarked && (
@@ -117,7 +155,7 @@ export const BingoCard = memo(function BingoCard({
                 key={`${c}-${shaking ? shakeK : 0}`}
                 type="button"
                 className="text-left cursor-pointer active:scale-95 transition-transform"
-                aria-label={cellMarked ? `${n} marked` : `Tap to daub ${n}`}
+                aria-label={cellMarked ? `${n} marked` : hinted ? `Tap to daub ${n}` : String(n)}
                 onClick={() => n !== null && onTapCell?.(n)}
               >
                 {cell}
@@ -126,6 +164,34 @@ export const BingoCard = memo(function BingoCard({
           })}
         </div>
       ))}
+
+      {/* Per-card BINGO! claim — arms only for THIS card's own daubs */}
+      {showBingo && (
+        <button
+          type="button"
+          disabled={!bingo || claiming || locked}
+          onClick={onClaim}
+          aria-live="polite"
+          className={`mt-1.5 w-full min-h-10 rounded-lg font-black tracking-widest text-base btn-juice transition-all
+            ${notYet
+              ? "bingo-deny bg-destructive text-white"
+              : bingo && !locked
+                ? "bingo-ready bg-accent text-accent-foreground cursor-pointer"
+                : "bg-secondary/60 text-muted-foreground cursor-not-allowed"}`}
+        >
+          {claiming ? (
+            <Loader2 className="w-4 h-4 animate-spin inline" />
+          ) : notYet ? (
+            "✕ NOT YET!"
+          ) : locked ? (
+            lockUntil ? `WAIT ${Math.max(1, Math.ceil((lockUntil - now) / 1000))}s` : "WAIT…"
+          ) : bingo ? (
+            "⚡ BINGO!"
+          ) : (
+            "BINGO!"
+          )}
+        </button>
+      )}
     </div>
   );
 });
