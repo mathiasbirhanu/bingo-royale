@@ -39,6 +39,12 @@ export interface LiveRoomState {
   awards: AwardRow[];
   lastSeq: number;
   nextBallInMs: number | null;
+  /** Live caller cadence — follows admin speed changes mid-round. */
+  intervalMs: number | null;
+  /** Live claim mode — follows admin toggles mid-round. */
+  autoClaim: boolean | null;
+  /** Deck size (75/90) from the events snapshot — powers the "balls left" chip. */
+  ballsTotal: number | null;
   transport: "socket" | "polling" | "connecting";
 }
 
@@ -51,6 +57,9 @@ export function useRoomLive(roomId: string | null, initialStatus: string): LiveR
     awards: [],
     lastSeq: 0,
     nextBallInMs: null,
+    intervalMs: null,
+    autoClaim: null,
+    ballsTotal: null,
     transport: "connecting",
   });
   const socketRef = useRef<Socket | null>(null);
@@ -97,6 +106,8 @@ export function useRoomLive(roomId: string | null, initialStatus: string): LiveR
           balls: Array<[number, number]>;
           awards: AwardRow[];
           nextBallInMs: number | null;
+          ballIntervalMs?: number;
+          ballsTotal?: number;
         }>(`/api/v1/rooms/${roomId}/events?afterSeq=${after}`, { retries: 1, timeoutMs: 9000 });
         if (full) {
           lastSeqRef.current = 0;
@@ -109,6 +120,8 @@ export function useRoomLive(roomId: string | null, initialStatus: string): LiveR
           ...s,
           status: snap.status,
           nextBallInMs: snap.nextBallInMs,
+          intervalMs: snap.ballIntervalMs ?? s.intervalMs,
+          ballsTotal: typeof snap.ballsTotal === "number" ? snap.ballsTotal : s.ballsTotal,
           transport: socketRef.current?.connected ? "socket" : "polling",
         }));
       } catch {
@@ -159,15 +172,28 @@ export function useRoomLive(roomId: string | null, initialStatus: string): LiveR
       if (disposed) return;
       socket.emit("subscribe", { roomId, lastSeq: lastSeqRef.current });
       setState((s) => ({ ...s, transport: "socket" }));
+      // Push channel is up — the safety-net poll can stand down.
+      if (pollTimer.current) clearTimeout(pollTimer.current);
+      pollTimer.current = null;
       // Subscribe raced a live draw? Catch-up closes any gap instantly.
       void catchUp(false);
     });
 
-    socket.on("disconnect", () => {
+    const degradeToPolling = () => {
       if (disposed) return;
-      setState((s) => ({ ...s, transport: "polling" }));
+      setState((s) => (s.transport === "polling" ? s : { ...s, transport: "polling" }));
       schedulePoll(); // degrade gracefully to REST polling
-    });
+    };
+
+    // The fallback must arm on EVERY failure shape: a socket that never
+    // connects fires connect_error (never disconnect), and a mid-session drop
+    // fires disconnect. The 5s safety net covers anything else — schedulePoll
+    // self-re-arms only while the socket stays down, so 2G radios stay quiet.
+    socket.on("disconnect", degradeToPolling);
+    socket.on("connect_error", degradeToPolling);
+    const safetyNet = setInterval(() => {
+      if (!disposed && !socketRef.current?.connected) schedulePollRef.current();
+    }, 5_000);
 
     socket.on("room-event", (evt: { id: string; type: string; payload: RoomEventPayload }) => {
       if (disposed || !evt || evt.payload?.roomId !== roomId) return;
@@ -205,6 +231,9 @@ export function useRoomLive(roomId: string | null, initialStatus: string): LiveR
           setState((s) => ({
             ...s,
             status: (evt.payload.status as string) ?? (evt.type === "ROUND_COMPLETED" ? "COMPLETED" : evt.type === "ROUND_VOIDED" ? "VOIDED" : s.status),
+            // Admin cadence/claim-mode changes ride ROOM_PHASE live.
+            intervalMs: typeof evt.payload.ballIntervalMs === "number" ? evt.payload.ballIntervalMs : s.intervalMs,
+            autoClaim: typeof evt.payload.autoClaim === "boolean" ? evt.payload.autoClaim : s.autoClaim,
           }));
           break;
       }
@@ -213,6 +242,7 @@ export function useRoomLive(roomId: string | null, initialStatus: string): LiveR
     return () => {
       disposed = true;
       clearTimeout(first);
+      clearInterval(safetyNet);
       if (pollTimer.current) clearTimeout(pollTimer.current);
       socket.removeAllListeners();
       socket.disconnect();
