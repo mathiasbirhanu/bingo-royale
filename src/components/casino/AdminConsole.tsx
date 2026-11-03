@@ -16,12 +16,13 @@ import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
 import { toast } from "@/hooks/use-toast";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Activity, Ban, CheckCircle2, Percent, ScrollText, Server, Gavel } from "lucide-react";
+import { Activity, Ban, CheckCircle2, Percent, ScrollText, Server, Gavel, Gauge, Hand, Eye } from "lucide-react";
 import { apiGet, apiPost, apiPut, etb, ApiClientError } from "@/lib/client/api";
+import { ballClass } from "@/lib/client/types";
 
 interface EngineData {
   engine: { booted: boolean; ticks: number; lastTickAt: string | null; lastTickMs: number | null; lastError: string | null };
-  liveRooms: Array<{ id: string; title: string; status: string; grossSantim: string }>;
+  liveRooms: Array<{ id: string; title: string; status: string; grossSantim: string; ballIntervalMs: number; autoClaim: boolean }>;
   outboxPending: number;
 }
 interface RoundsData {
@@ -50,6 +51,126 @@ const STATUS_TONE: Record<string, string> = {
 
 function Tone({ status }: { status: string }) {
   return <Badge variant="outline" className={STATUS_TONE[status] ?? "text-muted-foreground"}>{status}</Badge>;
+}
+
+/* ── Draw monitor — the owner-only called list + draw order (FR-ADM) ───────
+ * Players see ONE ball at a time; the full called history and the future
+ * draw sequence live here and only here. The order is the deterministic
+ * shuffle from the fairness seal — each number appears exactly once, which
+ * this panel makes checkable at a glance. */
+interface MonitorData {
+  title: string;
+  status: string;
+  variantId: string;
+  ballIntervalMs: number;
+  autoClaim: boolean;
+  players: number;
+  tickets: number;
+  ballsTotal: number;
+  calledBalls: Array<{ seq: number; ball: number }>;
+  drawOrder: number[] | null;
+  priceSantim: string;
+  netPoolSantim: string;
+}
+
+const BALL_LETTERS = ["B", "I", "N", "G", "O"];
+function ballLabel(variantId: string, ball: number): string {
+  if (variantId === "BALL_75") return `${BALL_LETTERS[Math.min(4, Math.floor((ball - 1) / 15))]}${ball}`;
+  return String(ball);
+}
+
+function DrawMonitor({ roomId, title }: { roomId: string; title: string }) {
+  const [open, setOpen] = useState(false);
+  const [data, setData] = useState<MonitorData | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  const toggle = async () => {
+    const next = !open;
+    setOpen(next);
+    if (next && !data && !err) {
+      try {
+        setData(await apiGet<MonitorData>(`/api/v1/admin/rounds/${roomId}`, { retries: 1 }));
+      } catch (e) {
+        setErr(e instanceof ApiClientError ? e.code : "Failed to load");
+      }
+    }
+  };
+
+  return (
+    <div className="space-y-1.5">
+      <button
+        onClick={toggle}
+        aria-expanded={open}
+        className={`inline-flex items-center gap-1 min-h-7 px-2 rounded-md text-[10px] font-black border transition-colors ${
+          open ? "border-primary bg-primary/20 text-primary" : "border-border bg-card/60 text-muted-foreground hover:border-primary/50"
+        }`}
+      >
+        <Eye className="w-3 h-3" /> {open ? "Hide draw monitor" : "Draw monitor"}
+      </button>
+      {open && (
+        !data ? (
+          <p className="text-[11px] text-muted-foreground">{err ?? `Loading ${title}…`}</p>
+        ) : (
+          <div className="space-y-2 rounded-lg bg-background/50 p-2">
+            <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-[10px] text-muted-foreground">
+              <span><b className="text-foreground tabular-nums">{data.players}</b> players</span>
+              <span><b className="text-foreground tabular-nums">{data.tickets}</b> cards</span>
+              <span><b className="text-foreground tabular-nums">{data.calledBalls.length}/{data.ballsTotal}</b> called</span>
+              <span>card <b className="text-foreground tabular-nums">{etb(data.priceSantim)} ETB</b></span>
+              <span>pool <b className="text-foreground tabular-nums">{etb(data.netPoolSantim)} ETB</b></span>
+              <span>{(data.ballIntervalMs / 1000).toFixed(1)}s/ball · {data.autoClaim ? "auto-pay" : "manual BINGO!"}</span>
+            </div>
+
+            <div>
+              <p className="text-[9px] uppercase tracking-wider text-muted-foreground font-bold mb-1">Called so far, in order</p>
+              {data.calledBalls.length === 0 ? (
+                <p className="text-[11px] text-muted-foreground">No balls drawn yet.</p>
+              ) : (
+                <div className="flex flex-wrap gap-1">
+                  {data.calledBalls.map((b) => (
+                    <span key={b.seq} className={`ball-sphere ${ballClass(b.ball)} w-7 h-7 text-[10px] font-black`}>
+                      {ballLabel(data.variantId, b.ball)}
+                    </span>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            <div>
+              <p className="text-[9px] uppercase tracking-wider text-muted-foreground font-bold mb-1">
+                Full draw order (owner-only · sealed until reveal)
+              </p>
+              {data.drawOrder ? (
+                <>
+                  <div className="flex flex-wrap gap-1 luxe-scroll max-h-24 overflow-y-auto">
+                    {data.drawOrder.map((n, i) => {
+                      const called = i < data.calledBalls.length;
+                      return (
+                        <span
+                          key={n}
+                          className={`inline-grid place-items-center min-w-7 h-7 px-1 rounded-md text-[10px] font-bold tabular-nums ${
+                            called ? "bg-primary/20 text-primary" : "bg-background/60 text-muted-foreground/60"
+                          }`}
+                          title={`ball #${i + 1}`}
+                        >
+                          {ballLabel(data.variantId, n)}
+                        </span>
+                      );
+                    })}
+                  </div>
+                  <p className="text-[10px] text-muted-foreground mt-1">
+                    {data.drawOrder.length} numbers, each exactly once — deterministic shuffle from the fairness seal (BallDraw enforces a unique ball per room in the DB).
+                  </p>
+                </>
+              ) : (
+                <p className="text-[11px] text-muted-foreground">The order materialises when the round locks (commitment published, seed sealed).</p>
+              )}
+            </div>
+          </div>
+        )
+      )}
+    </div>
+  );
 }
 
 async function action(promise: Promise<unknown>, what: string) {
@@ -123,9 +244,51 @@ export function AdminConsole() {
           </div>
         )}
         {engine?.liveRooms.map((r) => (
-          <div key={r.id} className="flex items-center justify-between text-xs bg-background/30 rounded-lg px-3 py-1.5">
-            <span className="font-semibold truncate">{r.title}</span>
-            <span className="flex items-center gap-2"><Tone status={r.status} /><span className="tabular-nums">{etb(r.grossSantim)} ETB</span></span>
+          <div key={r.id} className="bg-background/30 rounded-lg px-3 py-2 space-y-1.5">
+            <div className="flex items-center justify-between text-xs">
+              <span className="font-semibold truncate">{r.title}</span>
+              <span className="flex items-center gap-2"><Tone status={r.status} /><span className="tabular-nums">{etb(r.grossSantim)} ETB</span></span>
+            </div>
+            {/* Owner-only monitor: called list + full draw order */}
+            <DrawMonitor roomId={r.id} title={r.title} />
+            {/* Live caller tuning — the engine re-reads the room row every tick,
+                so a speed change lands on the very next ball. */}
+            {["SALES_OPEN", "LOCKED", "DRAWING"].includes(r.status) && (
+              <div className="flex items-center justify-between gap-2 flex-wrap">
+                <span className="inline-flex items-center gap-1 text-[10px] text-muted-foreground">
+                  <Gauge className="w-3 h-3" /> caller {r.ballIntervalMs >= 1000 ? `${(r.ballIntervalMs / 1000).toFixed(1)}s` : `${r.ballIntervalMs}ms`} / ball
+                </span>
+                <span className="flex items-center gap-1">
+                  {[1000, 2000, 3000, 5000].map((ms) => (
+                    <button
+                      key={ms}
+                      onClick={async () => {
+                        const ok = await action(apiPost(`/api/v1/admin/rounds/${r.id}`, { action: "set-speed", ballIntervalMs: ms }), `Caller speed → ${ms / 1000}s`);
+                        if (ok) void loadAll();
+                      }}
+                      aria-pressed={r.ballIntervalMs === ms}
+                      className={`min-h-7 px-2 rounded-md text-[10px] font-black border transition-colors ${
+                        r.ballIntervalMs === ms ? "border-primary bg-primary/20 text-primary" : "border-border bg-card/60 text-muted-foreground hover:border-primary/50"
+                      }`}
+                    >
+                      {ms / 1000}s
+                    </button>
+                  ))}
+                  <button
+                    onClick={async () => {
+                      const ok = await action(apiPost(`/api/v1/admin/rounds/${r.id}`, { action: "set-claim-mode", autoClaim: !r.autoClaim }), r.autoClaim ? "Claim mode → manual (players tap BINGO!)" : "Claim mode → auto-pay");
+                      if (ok) void loadAll();
+                    }}
+                    aria-pressed={!r.autoClaim}
+                    className={`min-h-7 px-2 rounded-md text-[10px] font-black border inline-flex items-center gap-1 transition-colors ${
+                      r.autoClaim ? "border-border bg-card/60 text-muted-foreground hover:border-accent/60" : "border-accent/60 bg-accent/20 text-accent-foreground"
+                    }`}
+                  >
+                    <Hand className="w-3 h-3" /> {r.autoClaim ? "AUTO-PAY" : "MANUAL"}
+                  </button>
+                </span>
+              </div>
+            )}
           </div>
         ))}
       </section>
@@ -170,6 +333,7 @@ export function AdminConsole() {
                   </Button>
                 </div>
               )}
+              <DrawMonitor roomId={r.id} title={r.title} />
             </div>
           ))}
           {!rounds && <Skeleton className="h-24 w-full bg-card/60" />}
