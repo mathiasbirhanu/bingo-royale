@@ -9,10 +9,11 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
-import { Loader2, Smartphone, ShieldCheck, Sparkles, Wifi } from "lucide-react";
+import { Loader2, Smartphone, ShieldCheck, Sparkles, Wifi, Zap } from "lucide-react";
 import { apiPost, ApiClientError } from "@/lib/client/api";
 import { useApp, type SessionUser } from "@/lib/client/store";
 import { usePhase, phaseCopy } from "@/lib/phase";
+import { playSfx } from "@/lib/client/sfx";
 
 export function Landing() {
   const { setUser, setBalance } = useApp();
@@ -27,6 +28,7 @@ export function Landing() {
   const requestOtp = async () => {
     setBusy(true);
     setError(null);
+    playSfx("tap");
     try {
       const data = await apiPost<{ sent: boolean; demoCode?: string; phone: string }>("/api/v1/auth", {
         action: "request-otp",
@@ -46,6 +48,7 @@ export function Landing() {
     setError(null);
     try {
       const data = await apiPost<{ user: SessionUser }>("/api/v1/auth", { action: "login", phone, code });
+      playSfx("coin");
       setUser(data.user);
       // Funded demo player lands ready to play.
       try {
@@ -62,21 +65,23 @@ export function Landing() {
   };
 
   return (
-    <div className="flex flex-col gap-6 pt-4">
-      {/* Hero */}
-      <section className="text-center space-y-3 pt-6">
-        <div className="flex items-center justify-center gap-3">
-          <span className="ball-sphere ball-b1 w-14 h-14 text-2xl shadow-lg">7</span>
-          <span className="ball-sphere ball-b4 w-16 h-16 text-3xl pulse-gold">B</span>
-          <span className="ball-sphere ball-b3 w-14 h-14 text-2xl shadow-lg">0</span>
+    <div className="flex flex-col gap-6 pt-2">
+      {/* Hero — TV-show energy */}
+      <section className="relative text-center space-y-4 pt-6">
+        <div aria-hidden className="pointer-events-none absolute left-1/2 top-0 -translate-x-1/2 w-72 h-72 rounded-full bg-[radial-gradient(circle,oklch(0.72_0.14_85/22%),transparent_65%)] blur-md" />
+        <div className="relative flex items-end justify-center gap-3">
+          <span className="ball-sphere ball-b1 w-14 h-14 text-2xl ball-drop" style={{ animationDelay: "0.12s" }}>7</span>
+          <span className="ball-sphere ball-b4 w-20 h-20 text-4xl ball-drop bob" style={{ animationDelay: "0s" }}>B</span>
+          <span className="ball-sphere ball-b3 w-14 h-14 text-2xl ball-drop" style={{ animationDelay: "0.24s" }}>0</span>
         </div>
-        <h1 className="gold-text text-4xl font-black tracking-tight">BINGO ROYALE</h1>
-        <p className="text-muted-foreground text-sm max-w-md mx-auto">
+        <h1 className="relative gold-text text-5xl font-black tracking-tight">BINGO ROYALE</h1>
+        <p className="relative text-muted-foreground text-sm max-w-md mx-auto">
           Ethiopia&apos;s provably-fair bingo hall. Play 75-ball &amp; 90-ball rounds from your phone — no card, no cash, pure Birr.
         </p>
-        <div className="flex flex-wrap items-center justify-center gap-2 pt-1">
+        <div className="relative flex flex-wrap items-center justify-center gap-2 pt-1">
           <Badge variant="outline" className="border-primary/50 text-primary"><ShieldCheck className="w-3 h-3 mr-1" />Commit-reveal fairness</Badge>
           <Badge variant="outline" className="border-primary/50 text-primary"><Wifi className="w-3 h-3 mr-1" />Low-data live play</Badge>
+          <Badge variant="outline" className="border-primary/50 text-primary"><Zap className="w-3 h-3 mr-1" />Instant payouts</Badge>
           <Badge variant="outline" className="border-accent/60 text-accent-foreground"><Sparkles className="w-3 h-3 mr-1" />{phaseCopy.landingBadge(phase)}</Badge>
         </div>
       </section>
@@ -103,8 +108,8 @@ export function Landing() {
               />
               <p className="text-xs text-muted-foreground">Ethiopian mobile numbers — +251, 09…, or 9… all work.</p>
             </div>
-            <Button className="btn-gold w-full font-bold min-h-11" disabled={busy || phone.trim().length < 9} onClick={requestOtp}>
-              {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : "Send my code"}
+            <Button className="btn-gold btn-shine btn-juice w-full font-black min-h-12 text-base tracking-wide" disabled={busy || phone.trim().length < 9} onClick={requestOtp}>
+              {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : "Send my code →"}
             </Button>
           </div>
         ) : (
@@ -129,8 +134,8 @@ export function Landing() {
                 onKeyDown={(e) => e.key === "Enter" && code.length >= 4 && login()}
               />
             </div>
-            <Button className="btn-gold w-full font-bold min-h-11" disabled={busy || code.length < 4} onClick={login}>
-              {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : "Enter the hall"}
+            <Button className="btn-gold btn-shine btn-juice w-full font-black min-h-12 text-base tracking-wide" disabled={busy || code.length < 4} onClick={login}>
+              {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : "Enter the hall →"}
             </Button>
             <Button variant="ghost" className="w-full" onClick={() => { setStep("phone"); setCode(""); }} disabled={busy}>
               Change number
