@@ -57,7 +57,8 @@ function Tone({ status }: { status: string }) {
  * Players see ONE ball at a time; the full called history and the future
  * draw sequence live here and only here. The order is the deterministic
  * shuffle from the fairness seal — each number appears exactly once, which
- * this panel makes checkable at a glance. */
+ * this panel makes checkable at a glance. Also the owner's tuning desk:
+ * card price (while selling) and the live caller speed. */
 interface MonitorData {
   title: string;
   status: string;
@@ -71,6 +72,9 @@ interface MonitorData {
   drawOrder: number[] | null;
   priceSantim: string;
   netPoolSantim: string;
+  scheduledAt: string;
+  commitment: string | null;
+  hash: string | null;
 }
 
 const BALL_LETTERS = ["B", "I", "N", "G", "O"];
@@ -79,22 +83,35 @@ function ballLabel(variantId: string, ball: number): string {
   return String(ball);
 }
 
-function DrawMonitor({ roomId, title }: { roomId: string; title: string }) {
+function DrawMonitor({ roomId, title, onPriceChanged }: { roomId: string; title: string; onPriceChanged?: () => void }) {
   const [open, setOpen] = useState(false);
   const [data, setData] = useState<MonitorData | null>(null);
   const [err, setErr] = useState<string | null>(null);
+  const [price, setPrice] = useState("");
+  const [customMs, setCustomMs] = useState("");
 
-  const toggle = async () => {
+  const fetchMonitor = useCallback(async () => {
+    try {
+      setData(await apiGet<MonitorData>(`/api/v1/admin/rounds/${roomId}`, { retries: 1 }));
+      setErr(null);
+    } catch (e) {
+      setErr(e instanceof ApiClientError ? e.code : "Failed to load");
+    }
+  }, [roomId]);
+
+  const toggle = () => {
     const next = !open;
     setOpen(next);
-    if (next && !data && !err) {
-      try {
-        setData(await apiGet<MonitorData>(`/api/v1/admin/rounds/${roomId}`, { retries: 1 }));
-      } catch (e) {
-        setErr(e instanceof ApiClientError ? e.code : "Failed to load");
-      }
-    }
+    if (next && !data && !err) void fetchMonitor();
   };
+
+  // Live while open: the called list, draw-order highlighting and pool track
+  // the engine every 4s (a fresh GET — the monitor is the owner's eye).
+  useEffect(() => {
+    if (!open || !data || !["SALES_OPEN", "LOCKED", "DRAWING"].includes(data.status)) return;
+    const t = setInterval(() => void fetchMonitor(), 4000);
+    return () => clearInterval(t);
+  }, [open, data, fetchMonitor]);
 
   return (
     <div className="space-y-1.5">
@@ -113,12 +130,68 @@ function DrawMonitor({ roomId, title }: { roomId: string; title: string }) {
         ) : (
           <div className="space-y-2 rounded-lg bg-background/50 p-2">
             <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-[10px] text-muted-foreground">
+              <span>start <b className="text-foreground tabular-nums">{new Date(data.scheduledAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</b></span>
               <span><b className="text-foreground tabular-nums">{data.players}</b> players</span>
               <span><b className="text-foreground tabular-nums">{data.tickets}</b> cards</span>
               <span><b className="text-foreground tabular-nums">{data.calledBalls.length}/{data.ballsTotal}</b> called</span>
               <span>card <b className="text-foreground tabular-nums">{etb(data.priceSantim)} ETB</b></span>
               <span>pool <b className="text-foreground tabular-nums">{etb(data.netPoolSantim)} ETB</b></span>
               <span>{(data.ballIntervalMs / 1000).toFixed(1)}s/ball · {data.autoClaim ? "auto-pay" : "manual BINGO!"}</span>
+            </div>
+
+            {/* Owner tuning desk — card price (while selling) + exact caller speed */}
+            <div className="flex flex-wrap items-center gap-2">
+              {["SCHEDULED", "SALES_OPEN"].includes(data.status) && (
+                <div className="flex items-center gap-1.5">
+                  <Input
+                    className="h-7 w-24 text-[11px]"
+                    inputMode="decimal"
+                    placeholder={`price ETB (${etb(data.priceSantim)})`}
+                    value={price}
+                    onChange={(e) => setPrice(e.target.value)}
+                  />
+                  <Button
+                    size="sm"
+                    className="btn-gold h-7 px-2.5 text-[10px] font-black"
+                    onClick={async () => {
+                      const etbVal = Number(price);
+                      if (!Number.isFinite(etbVal) || etbVal < 0.5 || etbVal > 5000) {
+                        toast({ title: "VALIDATION_FAILED", description: "Card price must be 0.50–5000 ETB.", variant: "destructive" });
+                        return;
+                      }
+                      const ok = await action(apiPost(`/api/v1/admin/rounds/${roomId}`, { action: "set-price", priceSantim: Math.round(etbVal * 100) }), `Card price → ${etbVal.toFixed(2)} ETB`);
+                      if (ok) { setPrice(""); void fetchMonitor(); onPriceChanged?.(); }
+                    }}
+                  >
+                    Set price
+                  </Button>
+                </div>
+              )}
+              <div className="flex items-center gap-1.5">
+                <Input
+                  className="h-7 w-24 text-[11px]"
+                  inputMode="numeric"
+                  placeholder={`speed ms (${data.ballIntervalMs})`}
+                  value={customMs}
+                  onChange={(e) => setCustomMs(e.target.value.replace(/[^0-9]/g, ""))}
+                />
+                <Button
+                  size="sm"
+                  className="btn-gold h-7 px-2.5 text-[10px] font-black"
+                  disabled={["SALES_OPEN", "LOCKED", "DRAWING"].includes(data.status) === false}
+                  onClick={async () => {
+                    const ms = Number(customMs);
+                    if (!Number.isInteger(ms) || ms < 500 || ms > 20000) {
+                      toast({ title: "VALIDATION_FAILED", description: "Speed must be 500–20000 ms per ball.", variant: "destructive" });
+                      return;
+                    }
+                    const ok = await action(apiPost(`/api/v1/admin/rounds/${roomId}`, { action: "set-speed", ballIntervalMs: ms }), `Caller speed → ${(ms / 1000).toFixed(1)}s/ball`);
+                    if (ok) { setCustomMs(""); void fetchMonitor(); }
+                  }}
+                >
+                  Set speed
+                </Button>
+              </div>
             </div>
 
             <div>
@@ -166,6 +239,16 @@ function DrawMonitor({ roomId, title }: { roomId: string; title: string }) {
                 <p className="text-[11px] text-muted-foreground">The order materialises when the round locks (commitment published, seed sealed).</p>
               )}
             </div>
+
+            {/* Fairness proof — owner-only verification anchors */}
+            {data.commitment && (
+              <details className="text-[10px] text-muted-foreground">
+                <summary className="cursor-pointer font-bold text-foreground/80">Fairness proof — commitment &amp; input hash</summary>
+                <p className="mt-1 break-all font-mono">commitment {data.commitment}</p>
+                <p className="break-all font-mono">input hash {data.hash ?? "—"}</p>
+                <p className="mt-1">The commitment fixes the draw order before the first ball; the hash binds the exact award inputs at reveal. No number can repeat: the order is a shuffle of 1–{data.ballsTotal}.</p>
+              </details>
+            )}
           </div>
         )
       )}
@@ -250,7 +333,7 @@ export function AdminConsole() {
               <span className="flex items-center gap-2"><Tone status={r.status} /><span className="tabular-nums">{etb(r.grossSantim)} ETB</span></span>
             </div>
             {/* Owner-only monitor: called list + full draw order */}
-            <DrawMonitor roomId={r.id} title={r.title} />
+            <DrawMonitor roomId={r.id} title={r.title} onPriceChanged={loadAll} />
             {/* Live caller tuning — the engine re-reads the room row every tick,
                 so a speed change lands on the very next ball. */}
             {["SALES_OPEN", "LOCKED", "DRAWING"].includes(r.status) && (
@@ -259,7 +342,7 @@ export function AdminConsole() {
                   <Gauge className="w-3 h-3" /> caller {r.ballIntervalMs >= 1000 ? `${(r.ballIntervalMs / 1000).toFixed(1)}s` : `${r.ballIntervalMs}ms`} / ball
                 </span>
                 <span className="flex items-center gap-1">
-                  {[1000, 2000, 3000, 5000].map((ms) => (
+                  {[500, 1000, 2000, 3000, 5000].map((ms) => (
                     <button
                       key={ms}
                       onClick={async () => {
@@ -271,7 +354,7 @@ export function AdminConsole() {
                         r.ballIntervalMs === ms ? "border-primary bg-primary/20 text-primary" : "border-border bg-card/60 text-muted-foreground hover:border-primary/50"
                       }`}
                     >
-                      {ms / 1000}s
+                      {ms % 1000 === 0 ? `${ms / 1000}s` : `${ms / 1000}s`}
                     </button>
                   ))}
                   <button
@@ -333,7 +416,7 @@ export function AdminConsole() {
                   </Button>
                 </div>
               )}
-              <DrawMonitor roomId={r.id} title={r.title} />
+              <DrawMonitor roomId={r.id} title={r.title} onPriceChanged={loadAll} />
             </div>
           ))}
           {!rounds && <Skeleton className="h-24 w-full bg-card/60" />}
