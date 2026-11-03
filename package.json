@@ -4,6 +4,8 @@
   "private": true,
   "scripts": {
     "dev": "next dev -p 3000",
+    "dev:log": "next dev -p 3000 2>&1 | tee dev.log",
+    "dev:test": "next dev -p 3100",
     "build": "next build && cp -r .next/static .next/standalone/.next/ && cp -r public .next/standalone/",
     "start": "NODE_ENV=production bun .next/standalone/server.js 2>&1 | tee server.log",
     "lint": "eslint .",
@@ -11,7 +13,8 @@
     "db:generate": "prisma generate",
     "db:migrate": "prisma migrate dev",
     "db:reset": "prisma migrate reset",
-    "setup": "bun install && prisma generate && prisma db push --accept-data-loss"
+    "seed": "bun run scripts/seed.ts",
+    "setup": "bun install && prisma generate && prisma db push --accept-data-loss && bun run scripts/seed.ts"
   },
   "dependencies": {
     "@dnd-kit/core": "^6.3.1",
