@@ -15,7 +15,8 @@ import { db } from "../../lib/db";
 import { parseJson } from "../../lib/json";
 import { emitOutbox } from "../../lib/write-path";
 import { makeCommitment } from "../game-core/draw";
-import type { PatternPayload } from "../game-core/patterns";
+import { gridSpec } from "../game-core/variants";
+import { patternWindowSeq, type PatternPayload } from "../game-core/patterns";
 import type { PrizeRule, RulesetPayload } from "../prize/rulesets";
 import { setRoomState, dropRoomState, type EnginePattern, type EngineRoomState } from "./state";
 
@@ -57,6 +58,16 @@ export async function buildRoomState(room: RoomRow): Promise<EngineRoomState> {
   const closedRules = new Set<string>();
   for (const p of patterns) if (closedVersionIds.has(p.versionId)) closedRules.add(p.entityId);
 
+  // Roll-up derivation (pure from committed state): an UNCLAIMED pattern whose
+  // claim window has passed is rolled into the pool — deterministic across
+  // restarts, so the roll-up can never double-fire or disagree with the tick.
+  const ballsTotal = gridSpec(room.variantId).ballsTotal;
+  const rolledRules = new Set<string>();
+  for (let i = 0; i < patterns.length; i++) {
+    if (closedRules.has(patterns[i].entityId)) continue;
+    if (drawnCount > patternWindowSeq(ballsTotal, i, patterns.length)) rolledRules.add(patterns[i].entityId);
+  }
+
   const state: EngineRoomState = {
     roomId: room.id,
     variantId: room.variantId,
@@ -65,6 +76,7 @@ export async function buildRoomState(room: RoomRow): Promise<EngineRoomState> {
     sequence: null,
     drawnCount,
     closedRules,
+    rolledRules,
     tickets: null,
   };
   setRoomState(state);
