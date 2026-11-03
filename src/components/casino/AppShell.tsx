@@ -5,10 +5,11 @@
  * thumb-reach bottom navigation (mobile-first casino layout). Sticky footer
  * posture: min-h flex column with mt-auto.
  */
-import { ReactNode } from "react";
-import { Dices, Wallet, History, ShieldHalf, Radio, Building2 } from "lucide-react";
+import { ReactNode, useEffect, useState } from "react";
+import { Dices, Wallet, History, ShieldHalf, Radio, Building2, Volume2, VolumeX, Coins } from "lucide-react";
 import { useApp, canSeeAdmin, canSeePortal } from "@/lib/client/store";
 import { usePhase } from "@/lib/phase";
+import { initSfx, playSfx, setSfxEnabled, sfxEnabled } from "@/lib/client/sfx";
 
 function NavButton({ view, label, icon, active, onClick }: { view: string; label: string; icon: ReactNode; active: boolean; onClick: () => void }) {
   return (
@@ -32,6 +33,29 @@ export function AppShell({ children }: { children: ReactNode }) {
   const phase = usePhase();
   const adminVisible = canSeeAdmin(user);
   const portalVisible = canSeePortal(user);
+  const [sound, setSound] = useState(true);
+
+  // Browsers allow audio only after a gesture — unlock on the first tap.
+  useEffect(() => {
+    const unlock = () => initSfx();
+    window.addEventListener("pointerdown", unlock, { once: true });
+    // Restore the persisted preference after hydration (avoids SSR mismatch).
+    const t = setTimeout(() => setSound(sfxEnabled()), 0);
+    return () => {
+      window.removeEventListener("pointerdown", unlock);
+      clearTimeout(t);
+    };
+  }, []);
+
+  const toggleSound = () => {
+    const next = !sound;
+    setSfxEnabled(next);
+    setSound(next);
+    if (next) {
+      initSfx();
+      playSfx("tap");
+    }
+  };
 
   return (
     <div className="casino-felt min-h-screen flex flex-col">
@@ -46,11 +70,19 @@ export function AppShell({ children }: { children: ReactNode }) {
               {phase}
             </span>
             <button
+              onClick={toggleSound}
+              aria-label={sound ? "Mute game sounds" : "Unmute game sounds"}
+              aria-pressed={sound}
+              className="grid place-items-center w-9 h-9 rounded-full border border-primary/30 bg-card/80 text-primary/90 hover:border-primary/60 transition-colors"
+            >
+              {sound ? <Volume2 className="w-4 h-4" /> : <VolumeX className="w-4 h-4 text-muted-foreground" />}
+            </button>
+            <button
               onClick={() => setView("wallet")}
-              className="gold-frame flex items-center gap-1.5 rounded-full px-3 py-1.5 bg-card/80"
+              className="gold-frame flex items-center gap-1.5 rounded-full px-3 py-1.5 bg-card/80 btn-juice"
               aria-label={`Balance ${balanceDisplay} birr — open wallet`}
             >
-              <span className="text-[9px] uppercase tracking-wider text-muted-foreground font-bold">ETB</span>
+              <Coins className="w-3.5 h-3.5 text-primary" />
               <span className="font-bold text-primary text-sm tabular-nums">{balanceDisplay}</span>
             </button>
           </div>
@@ -66,8 +98,8 @@ export function AppShell({ children }: { children: ReactNode }) {
 
       <footer className="mt-auto sticky bottom-0 z-40 border-t border-primary/20 bg-background/90 backdrop-blur-md pb-[env(safe-area-inset-bottom)]">
         <nav className="mx-auto max-w-3xl flex" aria-label="Main">
-          <NavButton view="lobby" label="Lobby" icon={<Dices className="w-5 h-5" />} active={view === "lobby"} onClick={() => setView("lobby")} />
-          <NavButton view="wallet" label="Wallet" icon={<Wallet className="w-5 h-5" />} active={view === "wallet"} onClick={() => setView("wallet")} />
+          <NavButton view="lobby" label="Lobby" icon={<Dices className="w-5 h-5" />} active={view === "lobby"} onClick={() => { playSfx("tap"); setView("lobby"); }} />
+          <NavButton view="wallet" label="Wallet" icon={<Wallet className="w-5 h-5" />} active={view === "wallet"} onClick={() => { playSfx("tap"); setView("wallet"); }} />
           {view === "room" && (
             <NavButton view="room" label="Live" icon={<Radio className="w-5 h-5 live-dot" />} active onClick={() => activeRoomId && openRoom(activeRoomId)} />
           )}
