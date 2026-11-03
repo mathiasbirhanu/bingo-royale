@@ -87,6 +87,22 @@ export function isPatternComplete(
   }
 }
 
+/**
+ * Claim window for pattern `index` (0-based) of `count` patterns on a deck of
+ * `ballsTotal` balls — the roll-up rule the business owner picked: a pattern
+ * nobody claims before its window closes folds its prize back into the pool,
+ * so every LATER pattern's tier amount grows (PERCENT_NET_POOL recomputes
+ * from the untouched escrow). The final pattern never expires — it lives
+ * until the deck is out.
+ *
+ * Pure and unit-tested; the client mirrors it to render "closes at ball N".
+ */
+export function patternWindowSeq(ballsTotal: number, index: number, count: number): number {
+  if (count <= 0) return ballsTotal;
+  if (index >= count - 1) return ballsTotal; // the last pattern never rolls up
+  return Math.round((ballsTotal * (index + 1)) / count);
+}
+
 /** Convenience constructors for the seeded catalogue. */
 export const PatternFactory = {
   row75(row: number): PatternPayload {
