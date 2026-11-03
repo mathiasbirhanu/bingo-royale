@@ -6,6 +6,7 @@
 import { db } from "../../lib/db";
 import { parseJson } from "../../lib/json";
 import { tierAmountFor, type RulesetPayload, type PrizeRule } from "../prize";
+import type { PatternPayload } from "../game-core/patterns";
 import type { Santim } from "../../lib/money";
 
 export interface RoomListItem {
@@ -64,12 +65,17 @@ export interface RoomDetail {
   maxCards: number;
   ballIntervalMs: number;
   autoClaim: boolean;
+  /** Distinct players holding cards this round — powers the live info bar. */
+  players: number;
   scheduledAt: string;
   salesOpenAt: string;
   salesCloseAt: string;
   grossSantim: string;
   netPoolSantim: string;
   prizeTable: PrizePreviewRow[];
+  /** Pinned pattern shapes — the client draws the "how to win" diagrams and
+   *  validates the BINGO! tap from exactly what the round resolves against. */
+  patterns: Array<{ patternId: string; label: string; payload: PatternPayload }>;
   myTickets: Array<{ ticketId: string; numbers: (number | null)[][] }>;
 }
 
@@ -86,6 +92,9 @@ export async function roomDetail(roomId: string, viewerPlayerId?: string): Promi
     },
   });
   if (!room) throw new Error("ROOM_NOT_FOUND");
+
+  // Distinct players in the round (the live info bar's "N players" chip).
+  const playerRows = await db.ticket.groupBy({ by: ["playerId"], where: { roomId: room.id } });
 
   const rulesetVersion = await db.configVersion.findUnique({ where: { id: room.rulesetVersionId } });
   const ruleset = parseJson<RulesetPayload>(rulesetVersion?.payloadJson ?? "{}", "ruleset");
@@ -110,6 +119,16 @@ export async function roomDetail(roomId: string, viewerPlayerId?: string): Promi
     };
   });
 
+  // Pattern shapes for the player UI (same pinned versions the round resolves
+  // against — FR-ROOM-02). A failed parse drops the diagram, never the round.
+  const patterns = patternVersions
+    .map((pv) => ({
+      patternId: pv.entityId,
+      label: labelByEntity.get(pv.entityId) ?? pv.entityId,
+      payload: parseJson<PatternPayload>(pv.payloadJson, `pattern:${pv.id}`),
+    }))
+    .filter((p): p is { patternId: string; label: string; payload: PatternPayload } => p.payload !== null);
+
   return {
     id: room.id,
     title: room.title,
@@ -118,8 +137,10 @@ export async function roomDetail(roomId: string, viewerPlayerId?: string): Promi
     tenantId: room.tenantId,
     priceSantim: room.priceSantim.toString(),
     maxCards: room.maxCardsPerPlayer,
+    patterns,
     ballIntervalMs: room.ballIntervalMs,
     autoClaim: room.autoClaim,
+    players: playerRows.length,
     scheduledAt: room.scheduledAt.toISOString(),
     salesOpenAt: room.salesOpenAt.toISOString(),
     salesCloseAt: room.salesCloseAt.toISOString(),
