@@ -219,7 +219,7 @@ export async function ensureRollingRooms(keepAhead = 3) {
           patternVersionIds: JSON.stringify(patternVersionIds),
           variantId: payload.variantId,
           priceSantim: BigInt(payload.priceSantim),
-          ballIntervalMs: payload.ballIntervalMs ?? 4000,
+          ballIntervalMs: payload.ballIntervalMs ?? 2000,
           autoClaim: payload.autoClaim ?? true,
           scheduledAt: nextStart,
           salesOpenAt: salesOpen,
