@@ -21,7 +21,7 @@ import { db } from "../../lib/db";
 import { emitOutbox } from "../../lib/write-path";
 import { generateDrawSequence, openSealedSeed } from "../game-core/draw";
 import { gridSpec } from "../game-core/variants";
-import { isPatternComplete } from "../game-core/patterns";
+import { isPatternComplete, patternWindowSeq } from "../game-core/patterns";
 import type { PrizeRule } from "../prize/rulesets";
 import type { EngineRoomState } from "./state";
 import { roomState } from "./state";
@@ -34,17 +34,18 @@ type RoomRow = Awaited<ReturnType<typeof db.room.findUniqueOrThrow>>;
 
 /**
  * Pure completion decision (unit-tested): a round completes when every tier
- * paid, or every ball drawn (auto rooms instantly; manual rooms only after
- * the claim grace window so a last-second BINGO! can still land).
+ * SETTLED (paid or rolled up), or every ball drawn (auto rooms instantly;
+ * manual rooms only after the claim grace window so a last-second BINGO! can
+ * still land).
  */
 export function shouldCompleteRound(args: {
   allBallsDrawn: boolean;
-  allTiersPaid: boolean;
+  allTiersSettled: boolean;
   autoClaim: boolean;
   lastBallCalledAt: number | null;
   now: number;
 }): boolean {
-  if (args.allTiersPaid) return true;
+  if (args.allTiersSettled) return true;
   if (!args.allBallsDrawn) return false;
   if (args.autoClaim) return true;
   if (args.lastBallCalledAt === null) return true;
@@ -70,7 +71,11 @@ export async function tickDrawing(room: RoomRow): Promise<void> {
   }
 
   const spec = gridSpec(room.variantId);
-  const allPaid = state.rules.length > 0 && state.closedRules.size >= state.rules.length;
+  // A tier is SETTLED when it paid (closed) or rolled up unclaimed — both
+  // release the round to complete. The two sets are disjoint by construction.
+  const allSettled =
+    state.rules.length > 0 &&
+    state.rules.every((r) => state.closedRules.has(r.patternRef) || state.rolledRules.has(r.patternRef));
 
   // Completion check on entry (covers restart-after-last-ball and the manual
   // grace window without drawing anything).
@@ -78,7 +83,7 @@ export async function tickDrawing(room: RoomRow): Promise<void> {
   if (
     shouldCompleteRound({
       allBallsDrawn: state.drawnCount >= spec.ballsTotal,
-      allTiersPaid: allPaid,
+      allTiersSettled: allSettled,
       autoClaim: room.autoClaim,
       lastBallCalledAt: lastAny?.calledAt.getTime() ?? null,
       now: Date.now(),
@@ -111,16 +116,33 @@ export async function tickDrawing(room: RoomRow): Promise<void> {
   });
   state.drawnCount = seq;
 
+  // ── Roll-up enforcement (the owner's rule) ────────────────────────────
+  // A pattern whose claim window just expired UNCLAIMED folds back into the
+  // pool: later patterns' tiers recompute from the untouched escrow, so the
+  // pots grow as the round heats up. Deterministic — lifecycle rebuilds the
+  // exact same set after a crash.
+  const patternCount = state.patterns.length;
+  for (let i = 0; i < patternCount; i++) {
+    const p = state.patterns[i];
+    if (state.closedRules.has(p.entityId) || state.rolledRules.has(p.entityId)) continue;
+    if (seq > patternWindowSeq(spec.ballsTotal, i, patternCount)) {
+      state.rolledRules.add(p.entityId);
+      console.log(`[engine] ${room.title} → "${p.label}" window closed UNCLAIMED @ball#${seq} — prize rolls up into the pool`);
+    }
+  }
+
   const called = new Set(state.sequence.slice(0, seq));
   if (room.autoClaim) {
     await resolveAwards(state, room, seq, ball, called);
   }
 
-  const paidNow = state.rules.length > 0 && state.closedRules.size >= state.rules.length;
+  const settledNow =
+    state.rules.length > 0 &&
+    state.rules.every((r) => state.closedRules.has(r.patternRef) || state.rolledRules.has(r.patternRef));
   if (
     shouldCompleteRound({
       allBallsDrawn: seq >= spec.ballsTotal,
-      allTiersPaid: paidNow,
+      allTiersSettled: settledNow,
       autoClaim: room.autoClaim,
       lastBallCalledAt: Date.now(),
       now: Date.now(),
@@ -170,7 +192,7 @@ async function resolveAwards(
   if (!state.tickets) return; // no sales — nothing to award
 
   for (const pattern of state.patterns) {
-    if (state.closedRules.has(pattern.entityId)) continue;
+    if (state.closedRules.has(pattern.entityId) || state.rolledRules.has(pattern.entityId)) continue;
     const rule = state.rules.find((r) => r.patternRef === pattern.entityId);
     if (!rule) continue;
 
