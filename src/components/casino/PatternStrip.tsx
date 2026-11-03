@@ -7,15 +7,20 @@
  * One vivid chip per pattern the round pays: a mini dot-diagram of the exact
  * pinned shape, its name and its live tier amount. State machine per chip:
  *   pending  — bright gradient border, saturated diagram;
- *   armed    — the NEXT tier the room is playing for glows (halo pulse);
+ *   armed    — the NEXT tier the room is playing for glows (halo pulse) and
+ *              shows its claim window ("by ball N", "hurry!" when 2 balls out);
  *   won      — gold flash → "WON" stamp → the chip fades to a ghost and the
  *              glow hands over to the next tier (driven by the live awards
- *              feed, so every player sees the fade at the same moment).
+ *              feed, so every player sees the fade at the same moment);
+ *   rolled   — window expired UNCLAIMED → "ROLLED →" stamp: the prize share
+ *              folds back into the pool and the later pots grow (the owner's
+ *              roll-up rule, mirrored client-side from the same pure window
+ *              function the engine enforces).
  */
 import { useMemo, type CSSProperties } from "react";
 import { Crown } from "lucide-react";
 import { gridSpec } from "@/modules/game-core/variants";
-import type { PatternPayload } from "@/lib/client/types";
+import { patternWindowSeq, type PatternPayload } from "@/modules/game-core/patterns";
 import type { PatternDef, PrizePreviewRow } from "@/lib/client/types";
 import type { AwardRow } from "@/lib/client/useRoomLive";
 import { etb } from "@/lib/client/api";
@@ -86,21 +91,33 @@ export function PatternStrip({
   prizeTable,
   awards,
   status,
+  calledCount = 0,
+  ballsTotal,
 }: {
   variantId: string;
   patterns: PatternDef[];
   prizeTable: PrizePreviewRow[];
   awards: AwardRow[];
   status: string;
+  calledCount?: number;
+  ballsTotal?: number | null;
 }) {
   // Tier amounts by pattern entity id (live pool recomputed server-side).
   const tierOf = useMemo(() => new Map(prizeTable.map((r) => [r.patternId, r.tierSantim])), [prizeTable]);
   const wonLabels = useMemo(() => new Set(awards.map((a) => a.label)), [awards]);
   if (patterns.length === 0) return null;
 
-  // The "armed" chip = first tier not yet paid — the room is playing for it.
-  const armedIndex = patterns.findIndex((p) => !wonLabels.has(p.label));
+  const total = ballsTotal ?? gridSpec(variantId).ballsTotal;
   const live = status === "DRAWING";
+
+  // Roll-up mirror (client-side, same pure function the engine enforces):
+  // an unclaimed pattern whose window passed shows ROLLED — its pot flows to
+  // the next tiers (the amounts below grow automatically with the pool).
+  const rolledOf = (index: number): boolean =>
+    live && !wonLabels.has(patterns[index].label) && calledCount > patternWindowSeq(total, index, patterns.length);
+
+  // The "armed" chip = first tier neither paid nor rolled — playing for it.
+  const armedIndex = patterns.findIndex((_, i) => !wonLabels.has(patterns[i].label) && !rolledOf(i));
 
   return (
     <section className="pattern-strip gold-frame rounded-2xl p-2.5" aria-label="Winning patterns for this round">
@@ -109,38 +126,51 @@ export function PatternStrip({
           <Crown className="w-3.5 h-3.5 text-primary" /> Win patterns
         </h3>
         <span className="text-[10px] text-muted-foreground">
-          {wonLabels.size > 0 ? `${wonLabels.size}/${patterns.length} won this round` : "first claim takes the tier"}
+          {wonLabels.size > 0 ? `${wonLabels.size}/${patterns.length} won this round` : live ? "tap BINGO! in time — pots roll up" : "claim in time — unclaimed pots roll up"}
         </span>
       </div>
       <div className="flex gap-2 overflow-x-auto luxe-scroll pb-0.5">
         {patterns.map((p, i) => {
           const hue = HUES[i % HUES.length];
           const won = wonLabels.has(p.label);
+          const rolled = rolledOf(i);
           const armed = live && i === armedIndex;
+          const window_ = patternWindowSeq(total, i, patterns.length);
+          const ballsToClose = window_ - calledCount;
+          // Won chips freeze at the amount actually paid (awards feed); open
+          // chips track the live pool — which grows when earlier tiers roll up.
+          const paidAmount = won ? awards.find((a) => a.label === p.label)?.winners[0]?.[1] : undefined;
+          const amount = paidAmount ?? tierOf.get(p.patternId);
           return (
             <div
               key={p.patternId}
               className={`pattern-chip relative flex items-center gap-2 rounded-xl px-2 py-1.5 flex-none
-                ${won ? "pattern-won" : ""} ${armed ? "pattern-armed" : ""}`}
+                ${won ? "pattern-won" : ""} ${armed ? "pattern-armed" : ""} ${rolled ? "pattern-rolled" : ""}`}
               style={{
                 "--ph": hue.main,
                 "--ph-soft": hue.soft,
                 "--ph-glow": hue.glow,
               } as CSSProperties}
               role="status"
-              aria-label={won ? `${p.label} — won` : armed ? `${p.label} — playing for it now` : p.label}
+              aria-label={won ? `${p.label} — won` : rolled ? `${p.label} — rolled up into the pool` : armed ? `${p.label} — playing for it now` : p.label}
             >
-              <MiniDiagram variantId={variantId} payload={p.payload} hue={hue.main} dim={won} />
+              <MiniDiagram variantId={variantId} payload={p.payload} hue={hue.main} dim={won || rolled} />
               <div className="min-w-0 pr-1">
-                <p className={`text-[12px] font-black leading-tight truncate ${won ? "line-through decoration-2" : ""}`} style={{ color: won ? undefined : hue.main }}>
+                <p className={`text-[12px] font-black leading-tight truncate ${won || rolled ? "line-through decoration-2" : ""}`} style={{ color: won || rolled ? undefined : hue.main }}>
                   {p.label}
                 </p>
                 <p className="text-[11px] font-bold tabular-nums text-foreground/85">
-                  {tierOf.get(p.patternId) ? etb(tierOf.get(p.patternId)!) : "—"}
+                  {amount ? etb(amount) : "—"}
                   <span className="text-[9px] font-normal text-muted-foreground"> ETB</span>
                 </p>
+                {armed && !won && !rolled && (
+                  <p className={`text-[9px] font-black uppercase tracking-wide ${ballsToClose <= 2 ? "text-destructive" : "text-muted-foreground"}`}>
+                    {ballsToClose <= 2 ? `⚡ hurry — ${Math.max(0, ballsToClose)} ball${ballsToClose === 1 ? "" : "s"} left` : `claim by ball ${window_}`}
+                  </p>
+                )}
               </div>
               {won && <span className="pattern-stamp">WON</span>}
+              {rolled && !won && <span className="pattern-stamp pattern-stamp-rolled">ROLLED →</span>}
             </div>
           );
         })}
