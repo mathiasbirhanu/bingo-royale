@@ -2,6 +2,16 @@
 
 /** Shared client-side view models (mirrors API payloads). */
 
+import type { PatternPayload } from "@/modules/game-core/patterns";
+
+export type { PatternPayload };
+
+export interface PatternDef {
+  patternId: string;
+  label: string;
+  payload: PatternPayload;
+}
+
 export interface RoomListItem {
   id: string;
   title: string;
@@ -33,12 +43,17 @@ export interface RoomDetail {
   maxCards: number;
   ballIntervalMs: number;
   autoClaim: boolean;
+  /** Distinct players holding cards this round — live info bar (FR-PLY-01). */
+  players: number;
   scheduledAt: string;
   salesOpenAt: string;
   salesCloseAt: string;
   grossSantim: string;
   netPoolSantim: string;
   prizeTable: PrizePreviewRow[];
+  /** Pinned pattern shapes — powers the "How to win" diagrams and the
+   *  client-side BINGO!-ready detection (same payloads the engine uses). */
+  patterns: PatternDef[];
   myTickets: Array<{ ticketId: string; numbers: (number | null)[][] }>;
 }
 
