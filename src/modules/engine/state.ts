@@ -26,6 +26,12 @@ export interface EngineRoomState {
   drawnCount: number;
   /** Pattern entityIds whose tier has already paid (tier closes at first award). */
   closedRules: Set<string>;
+  /**
+   * Pattern entityIds whose claim window expired UNCLAIMED — the roll-up rule:
+   * their prize share stays in the escrow so later patterns pay more. Never
+   * pays; rebuilt deterministically from drawnCount + confirmed claims.
+   */
+  rolledRules: Set<string>;
   /** Lazily loaded ticket index at first draw: ticketId → { playerId, cells }. */
   tickets: Map<string, { playerId: string; cells: (number | null)[][] }> | null;
 }
