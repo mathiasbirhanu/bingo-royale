@@ -7,7 +7,7 @@ export const GET = route(async () => {
   const live = await db.room.findMany({
     where: { status: { in: ["SCHEDULED", "SALES_OPEN", "LOCKED", "DRAWING", "RESOLVING"] } },
     orderBy: { scheduledAt: "asc" },
-    select: { id: true, title: true, status: true, scheduledAt: true, ballIntervalMs: true, grossSantim: true },
+    select: { id: true, title: true, status: true, scheduledAt: true, ballIntervalMs: true, autoClaim: true, grossSantim: true },
   });
   const outboxLag = await db.outboxEvent.count({ where: { publishedAt: null } });
   return jsonOk({ engine: engineStatus(), liveRooms: live.map((r) => ({ ...r, grossSantim: r.grossSantim.toString() })), outboxPending: outboxLag });
