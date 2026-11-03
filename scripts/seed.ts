@@ -10,6 +10,10 @@
  *   · one approved commission plan (UC-12, D-PRT-02 turnover basis)
  *   · rolling demo rooms via the production scheduler input
  *
+ * Room templates republish a new ConfigVersion when the payload changes, so
+ * existing installs pick up tuned cadence/claim settings on re-seed without
+ * touching live or finished rounds (UC-07 versioning keeps history intact).
+ *
  * Run: bun run scripts/seed.ts
  */
 import { db } from "../src/lib/db";
@@ -43,6 +47,8 @@ async function publishEntity(input: {
   tenantId: string | null;
   payload: unknown;
   publishedById: string;
+  /** Republish a new version when the payload differs (templates only). */
+  republishIfChanged?: boolean;
 }) {
   const existing = await db.configEntity.findFirst({
     where: { type: input.type, name: input.name, tenantId: input.tenantId },
@@ -51,7 +57,31 @@ async function publishEntity(input: {
     const v = await db.configVersion.findFirst({
       where: { entityId: existing.id, version: existing.currentVersion },
     });
-    if (v) return { entity: existing, version: v };
+    if (v) {
+      if (input.republishIfChanged && !existing.locked) {
+        let same = false;
+        try {
+          same = JSON.stringify(JSON.parse(v.payloadJson)) === JSON.stringify(input.payload);
+        } catch {
+          same = false;
+        }
+        if (!same) {
+          const version = await db.configVersion.create({
+            data: {
+              entityId: existing.id,
+              version: existing.currentVersion + 1,
+              payloadJson: JSON.stringify(input.payload),
+              payloadHash: hashPayload(input.payload),
+              publishedById: input.publishedById,
+            },
+          });
+          await db.configEntity.update({ where: { id: existing.id }, data: { currentVersion: version.version } });
+          console.log(`↻ republished ${input.name} → v${version.version} (tuned settings)`);
+          return { entity: { ...existing, currentVersion: version.version }, version };
+        }
+      }
+      return { entity: existing, version: v };
+    }
   }
   const entity =
     existing ??
@@ -135,6 +165,7 @@ async function main() {
     type: "ROOM_TEMPLATE",
     name: "Golden Hall 75",
     tenantId: null,
+    republishIfChanged: true,
     payload: {
       title: "Golden Hall 75",
       variantId: "BALL_75",
@@ -142,8 +173,8 @@ async function main() {
       cadenceMinutes: 10,
       salesOpenMinutes: 4,
       salesMinutes: 1,
-      ballIntervalMs: 3000,
-      autoClaim: true,
+      ballIntervalMs: 2000,
+      autoClaim: false,
       rulesetRef: rs75.entity.id,
       patternRefs: [corners.entity.id, xPattern.entity.id, topLine.entity.id, blackout.entity.id],
     },
@@ -153,6 +184,7 @@ async function main() {
     type: "ROOM_TEMPLATE",
     name: "Rapid Fire 90",
     tenantId: null,
+    republishIfChanged: true,
     payload: {
       title: "Rapid Fire 90",
       variantId: "BALL_90",
@@ -160,14 +192,14 @@ async function main() {
       cadenceMinutes: 8,
       salesOpenMinutes: 3,
       salesMinutes: 1,
-      ballIntervalMs: 2500,
-      autoClaim: true,
+      ballIntervalMs: 1800,
+      autoClaim: false,
       rulesetRef: rs90.entity.id,
       patternRefs: [line90.entity.id, twoLines90.entity.id, fullHouse90.entity.id],
     },
     publishedById: admin.id,
   });
-  console.log("✓ room templates (Golden Hall 75, Rapid Fire 90)");
+  console.log("✓ room templates (Golden Hall 75 @2s, Rapid Fire 90 @1.8s — manual BINGO! claims)");
 
   // 7. Tenant (KYB-approved) + owner + commission plan (UC-11/12).
   let tenant = await db.tenant.findFirst({ where: { code: "SHEGER" } });
@@ -210,6 +242,7 @@ async function main() {
     type: "ROOM_TEMPLATE",
     name: "Sheger Lounge 90",
     tenantId: tenant.id,
+    republishIfChanged: true,
     payload: {
       title: "Sheger Lounge 90",
       variantId: "BALL_90",
@@ -217,8 +250,8 @@ async function main() {
       cadenceMinutes: 12,
       salesOpenMinutes: 4,
       salesMinutes: 1,
-      ballIntervalMs: 3000,
-      autoClaim: true,
+      ballIntervalMs: 2200,
+      autoClaim: false,
       rulesetRef: rs90.entity.id,
       patternRefs: [line90.entity.id, twoLines90.entity.id, fullHouse90.entity.id],
     },
