@@ -5,15 +5,16 @@
  * one-tap entry. Polls the room list on a slow cycle (low-data: this endpoint
  * is a few hundred bytes; the live action happens inside a room only).
  */
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState, type CSSProperties } from "react";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Badge } from "@/components/ui/badge";
-import { Users, Ticket, Trophy, Timer } from "lucide-react";
+import { Users, Ticket, Trophy, Timer, Radio } from "lucide-react";
 import { apiGet, etb } from "@/lib/client/api";
 import { useApp } from "@/lib/client/store";
 import { usePhase, phaseCopy } from "@/lib/phase";
 import { ROOM_STATUS_LABEL, type RoomListItem } from "@/lib/client/types";
+import { playSfx } from "@/lib/client/sfx";
 
 function Countdown({ target, status }: { target: string; status: string }) {
   const [now, setNow] = useState(() => Date.now());
@@ -23,57 +24,87 @@ function Countdown({ target, status }: { target: string; status: string }) {
   }, []);
   if (status !== "SCHEDULED" && status !== "SALES_OPEN") return null;
   const diff = new Date(target).getTime() - now;
-  if (diff <= 0) return <span className="tabular-nums text-primary font-bold">starting…</span>;
+  if (diff <= 0) return <span className="tabular-nums text-accent-foreground font-black">starting…</span>;
   const m = Math.floor(diff / 60000);
   const s = Math.floor((diff % 60000) / 1000);
+  const urgent = diff < 90_000;
   return (
-    <span className="tabular-nums text-primary font-bold inline-flex items-center gap-1">
-      <Timer className="w-3.5 h-3.5" />
+    <span className={`tabular-nums font-black inline-flex items-center gap-1 ${urgent ? "text-accent-foreground" : "text-primary"}`}>
+      <Timer className={`w-3.5 h-3.5 ${urgent ? "live-dot" : ""}`} />
       {m}:{s.toString().padStart(2, "0")}
     </span>
   );
 }
 
+/** Warm accent themes — no blue, matches the Royale palette. */
+const THEMES: CSSProperties[] = [
+  { "--rc1": "oklch(0.64 0.19 28)", "--rc2": "oklch(0.48 0.16 32)" } as CSSProperties,   // crimson
+  { "--rc1": "oklch(0.8 0.15 88)", "--rc2": "oklch(0.6 0.13 74)" } as CSSProperties,    // gold
+  { "--rc1": "oklch(0.64 0.13 155)", "--rc2": "oklch(0.44 0.1 158)" } as CSSProperties, // emerald
+  { "--rc1": "oklch(0.62 0.11 50)", "--rc2": "oklch(0.44 0.09 44)" } as CSSProperties,  // bronze
+  { "--rc1": "oklch(0.68 0.17 12)", "--rc2": "oklch(0.5 0.14 16)" } as CSSProperties,   // rose
+];
+function themeFor(id: string): CSSProperties {
+  let h = 0;
+  for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) >>> 0;
+  return THEMES[h % THEMES.length];
+}
+
 function RoomCard({ room, onEnter }: { room: RoomListItem; onEnter: () => void }) {
   const live = room.status === "DRAWING";
   const salesOpen = room.status === "SALES_OPEN";
+  const fill = room.maxCards > 0 ? Math.min(100, Math.round((room.tickets / room.maxCards) * 100)) : 0;
   return (
-    <article className={`gold-frame rounded-2xl bg-card/85 p-4 space-y-3 ${live ? "ring-1 ring-accent/60" : ""}`}>
+    <article
+      style={themeFor(room.id)}
+      className={`room-card gold-frame rounded-2xl bg-card/85 p-4 pt-5 space-y-3 ${live ? "room-live ring-1 ring-accent/50" : ""}`}
+    >
       <div className="flex items-start justify-between gap-2">
         <div className="min-w-0">
-          <h3 className="font-bold truncate text-[15px]">{room.title}</h3>
-          <p className="text-xs text-muted-foreground">
+          <h3 className="font-black truncate text-base">{room.title}</h3>
+          <p className="text-[11px] text-muted-foreground">
             {room.variantId === "BALL_75" ? "75-ball · American" : "90-ball · UK style"}
             {room.tenantId ? " · partner hall" : " · house hall"}
           </p>
         </div>
         {live ? (
-          <Badge className="bg-accent text-accent-foreground gap-1.5">
-            <span className="live-dot inline-block w-1.5 h-1.5 rounded-full bg-white" /> LIVE
+          <Badge className="bg-accent text-accent-foreground gap-1.5 font-black">
+            <Radio className="w-3 h-3 live-dot" /> LIVE
           </Badge>
         ) : (
-          <Badge variant="outline" className={salesOpen ? "border-primary/60 text-primary" : "text-muted-foreground"}>
+          <Badge variant="outline" className={salesOpen ? "border-primary/60 text-primary font-bold" : "text-muted-foreground"}>
             {ROOM_STATUS_LABEL[room.status] ?? room.status}
           </Badge>
         )}
       </div>
 
       <div className="grid grid-cols-3 gap-2 text-center">
-        <div className="rounded-lg bg-background/50 py-1.5">
-          <p className="text-[10px] uppercase tracking-wider text-muted-foreground">Card</p>
-          <p className="font-bold text-primary text-sm">{etb(room.priceSantim)} <span className="text-[10px] font-normal text-muted-foreground">ETB</span></p>
+        <div className="rounded-lg bg-background/55 py-1.5">
+          <p className="text-[9px] uppercase tracking-widest text-muted-foreground">Card</p>
+          <p className="font-black text-primary text-sm">{etb(room.priceSantim)}<span className="text-[9px] font-normal text-muted-foreground"> ETB</span></p>
         </div>
-        <div className="rounded-lg bg-background/50 py-1.5">
-          <p className="text-[10px] uppercase tracking-wider text-muted-foreground">Players</p>
+        <div className="rounded-lg bg-background/55 py-1.5">
+          <p className="text-[9px] uppercase tracking-widest text-muted-foreground">Players</p>
           <p className="font-bold text-sm inline-flex items-center gap-1"><Users className="w-3 h-3 text-muted-foreground" />{room.players}</p>
         </div>
-        <div className="rounded-lg bg-background/50 py-1.5">
-          <p className="text-[10px] uppercase tracking-wider text-muted-foreground">Cards</p>
-          <p className="font-bold text-sm inline-flex items-center gap-1"><Ticket className="w-3 h-3 text-muted-foreground" />{room.tickets}</p>
+        <div className="rounded-lg bg-background/55 py-1.5">
+          <p className="text-[9px] uppercase tracking-widest text-muted-foreground">In play</p>
+          <p className="font-bold text-sm inline-flex items-center gap-1"><Trophy className="w-3 h-3 text-primary" />{room.tickets}</p>
         </div>
       </div>
 
-      <div className="flex items-center justify-between gap-3">
+      {/* seat fill — scarcity you can see */}
+      <div>
+        <div className="flex items-center justify-between text-[10px] text-muted-foreground mb-1">
+          <span className="inline-flex items-center gap-1"><Ticket className="w-3 h-3" />{room.tickets} / {room.maxCards} cards</span>
+          <span>{fill}% sold</span>
+        </div>
+        <div className="h-1.5 rounded-full bg-background/70 overflow-hidden">
+          <div className="fill-bar h-full rounded-full transition-all duration-700" style={{ width: `${fill}%` }} />
+        </div>
+      </div>
+
+      <div className="flex items-center justify-between gap-3 pt-0.5">
         <div className="text-sm text-muted-foreground">
           {live || salesOpen ? (
             <span className="inline-flex items-center gap-1"><Trophy className="w-3.5 h-3.5 text-primary" /><Countdown target={room.scheduledAt} status={room.status} /></span>
@@ -81,8 +112,12 @@ function RoomCard({ room, onEnter }: { room: RoomListItem; onEnter: () => void }
             <span>Opens <Countdown target={room.salesOpenAt} status={room.status} /></span>
           )}
         </div>
-        <Button size="sm" className="btn-gold font-bold min-h-10 px-5" onClick={onEnter}>
-          {live ? "Watch live" : salesOpen ? "Buy cards" : "Preview"}
+        <Button
+          size="sm"
+          className="btn-gold btn-shine btn-juice font-black min-h-10 px-6 tracking-wide"
+          onClick={() => { playSfx("tap"); onEnter(); }}
+        >
+          {live ? "WATCH LIVE" : salesOpen ? "PLAY NOW" : "PREVIEW"}
         </Button>
       </div>
     </article>
@@ -134,7 +169,7 @@ export function Lobby() {
       </div>
 
       <div className="flex items-center justify-between">
-        <h2 className="font-black text-lg gold-text">The Floor</h2>
+        <h2 className="font-black text-xl gold-text">The Floor</h2>
         <span className="text-xs text-muted-foreground">{rooms ? `${rooms.length} rounds on the board` : "dealing…"}</span>
       </div>
 
