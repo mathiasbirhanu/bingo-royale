@@ -4,9 +4,13 @@
  * Semantics (honest by construction):
  *   · The server never trusts client daubs — it validates every claim against
  *     the CALLED-ball set (the same source the auto-claim engine uses).
- *   · The caller's completed tickets select the tier; the tier then pays
- *     across EVERY ticket in the room that completes it at this ball — the
+ *   · The caller's completed tickets select the tier — and the caller must
+ *     have DAUBED every pattern cell on the card they claim with (manual play
+ *     is the game: daubs arrive per card, are intersected with the called
+ *     set, and uncalled marks count for nothing). The tier then pays across
+ *     EVERY ticket in the room that completes it at this ball — the
  *     "simultaneous winners split evenly" rule survives manual claiming.
+ *   · Rolled-up patterns (window expired unclaimed) never pay.
  *   · The tier closes at first payment (identical to auto-claim), and the
  *     in-process grain state is updated in the same turn so the next tick
  *     never double-pays (ADR-01 single-process grain).
@@ -27,6 +31,12 @@ import { payTier } from "./pay";
 
 /** How long a manual room waits on the last ball for late BINGO! claims. */
 export const CLAIM_GRACE_MS = 20_000;
+
+/** The caller's daubs for one of their cards — per-card, never shared. */
+export interface ClaimDaub {
+  ticketId: string;
+  numbers: number[];
+}
 
 export interface ClaimOutcome {
   claimed: boolean;
@@ -59,8 +69,15 @@ export interface PickInput {
   patterns: ClaimPatternDef[];
   /** Pattern entityIds already paid this round. */
   closedRules: Set<string>;
-  /** The claimer's card grids. */
-  myTickets: Array<(number | null)[][]>;
+  /** Pattern entityIds rolled up unclaimed (window expired) — never pay. */
+  rolledRules?: Set<string>;
+  /**
+   * The caller's OWN cards, each with the daubs the player actually tapped on
+   * THAT card. Manual play is honest: a tier only pays the caller if they
+   * marked every pattern cell on the card they claim with. Daubs are filtered
+   * to the called set server-side — an uncalled mark can never count.
+   */
+  myTickets: Array<{ ticketId: string; cells: (number | null)[][]; daubed: Set<number> }>;
   /** Every ticket in the room (fair split across all completers). */
   allTickets: Array<{ ticketId: string; playerId: string; cells: (number | null)[][] }>;
   called: Set<number>;
@@ -70,13 +87,23 @@ export type PickResult =
   | { pattern: ClaimPatternDef; ruleIndex: number; winners: Array<{ ticketId: string; playerId: string }> }
   | { pattern: null; best: { label: string; remaining: number } | null };
 
-/** How many more marks a card needs to complete this pattern (0 = complete). */
-export function patternRemaining(variantId: string, cells: (number | null)[][], called: Set<number>, payload: PatternPayload): number {
+/** How many more marks a card needs to complete this pattern (0 = complete).
+ *  `marked` overrides the called set — the caller's daubs (filtered to called)
+ *  decide whether THEY completed the tier; other winners are checked against
+ *  the called set (classic split fairness). */
+export function patternRemaining(
+  variantId: string,
+  cells: (number | null)[][],
+  called: Set<number>,
+  payload: PatternPayload,
+  marked?: Set<number>
+): number {
   const spec = gridSpec(variantId);
+  const markedSet = marked ?? called;
   const isMarked = (r: number, c: number): boolean => {
     const n = cells[r]?.[c];
     if (n === null) return spec.freeCells.some(([fr, fc]) => fr === r && fc === c);
-    return called.has(n);
+    return markedSet.has(n);
   };
   switch (payload.kind) {
     case "CELLS":
@@ -86,7 +113,7 @@ export function patternRemaining(variantId: string, cells: (number | null)[][], 
       for (let r = 0; r < spec.rows; r++) {
         let all = true;
         for (let c = 0; c < spec.cols; c++) {
-          if (cells[r][c] !== null && !called.has(cells[r][c] as number)) {
+          if (cells[r][c] !== null && !markedSet.has(cells[r][c] as number)) {
             all = false;
             break;
           }
@@ -97,7 +124,7 @@ export function patternRemaining(variantId: string, cells: (number | null)[][], 
     }
     case "FULL_HOUSE": {
       let missing = 0;
-      for (const row of cells) for (const n of row) if (n !== null && !called.has(n)) missing++;
+      for (const row of cells) for (const n of row) if (n !== null && !markedSet.has(n)) missing++;
       return missing;
     }
   }
@@ -110,17 +137,21 @@ export function patternRemaining(variantId: string, cells: (number | null)[][], 
  */
 export function pickClaim(input: PickInput): PickResult {
   const { variantId, rules, patterns, closedRules, myTickets, allTickets, called } = input;
+  const rolled = input.rolledRules ?? new Set<string>();
   const byEntity = new Map(patterns.map((p) => [p.entityId, p]));
   let best: { label: string; remaining: number } | null = null;
 
   for (let i = 0; i < rules.length; i++) {
     const rule = rules[i];
     const pattern = byEntity.get(rule.patternRef);
-    if (!pattern || closedRules.has(pattern.entityId)) continue;
+    if (!pattern || closedRules.has(pattern.entityId) || rolled.has(pattern.entityId)) continue;
 
     let myRemaining = Infinity;
-    for (const cells of myTickets) {
-      const rem = patternRemaining(variantId, cells, called, pattern.payload);
+    for (const t of myTickets) {
+      // The caller's own marks: daubs ∩ called (server truth — an uncalled
+      // daub counts for nothing), never another card's daubs.
+      const marked = new Set([...t.daubed].filter((n) => called.has(n)));
+      const rem = patternRemaining(variantId, t.cells, called, pattern.payload, marked);
       if (rem < myRemaining) myRemaining = rem;
     }
     if (myRemaining === Infinity) continue;
@@ -169,7 +200,7 @@ async function loadTicketsInto(state: EngineRoomState): Promise<void> {
 /** Per-room claim mutex — serializes BINGO! claims within the grain (ADR-01). */
 const locks = new Map<string, Promise<void>>();
 
-export async function claimPrize(roomId: string, playerId: string): Promise<ClaimOutcome> {
+export async function claimPrize(roomId: string, playerId: string, daubs: ClaimDaub[] = []): Promise<ClaimOutcome> {
   const prev = locks.get(roomId) ?? Promise.resolve();
   let release!: () => void;
   const gate = new Promise<void>((resolve) => (release = resolve));
@@ -179,14 +210,14 @@ export async function claimPrize(roomId: string, playerId: string): Promise<Clai
   );
   await prev;
   try {
-    return await claimPrizeInner(roomId, playerId);
+    return await claimPrizeInner(roomId, playerId, daubs);
   } finally {
     release();
     if (locks.get(roomId) === gate) locks.delete(roomId);
   }
 }
 
-async function claimPrizeInner(roomId: string, playerId: string): Promise<ClaimOutcome> {
+async function claimPrizeInner(roomId: string, playerId: string, daubs: ClaimDaub[]): Promise<ClaimOutcome> {
   const room = await db.room.findUnique({ where: { id: roomId } });
   if (!room) return { claimed: false, reason: "ROOM_NOT_FOUND", message: "Round not found." };
   if (room.status !== "DRAWING") {
@@ -211,11 +242,25 @@ async function claimPrizeInner(roomId: string, playerId: string): Promise<ClaimO
   const seq = balls.length ? balls[balls.length - 1].seq : 0;
   const ball = balls.length ? balls[balls.length - 1].ball : 0;
 
-  const myTickets: Array<(number | null)[][]> = [];
+  // The caller's per-card daubs. Server truth applies twice: daubs for cards
+  // the player doesn't hold are dropped, and every daub is intersected with
+  // the called set inside pickClaim — uncalled marks can never win money.
+  const daubByTicket = new Map<string, Set<number>>();
+  for (const d of Array.isArray(daubs) ? daubs : []) {
+    if (!d || typeof d.ticketId !== "string" || !Array.isArray(d.numbers)) continue;
+    daubByTicket.set(
+      d.ticketId,
+      new Set(d.numbers.filter((n): n is number => typeof n === "number" && Number.isInteger(n)))
+    );
+  }
+
+  const myTickets: Array<{ ticketId: string; cells: (number | null)[][]; daubed: Set<number> }> = [];
   const allTickets: Array<{ ticketId: string; playerId: string; cells: (number | null)[][] }> = [];
   for (const [ticketId, t] of state.tickets!) {
     allTickets.push({ ticketId, playerId: t.playerId, cells: t.cells });
-    if (t.playerId === playerId) myTickets.push(t.cells);
+    if (t.playerId === playerId) {
+      myTickets.push({ ticketId, cells: t.cells, daubed: daubByTicket.get(ticketId) ?? new Set<number>() });
+    }
   }
   if (myTickets.length === 0) {
     return { claimed: false, reason: "NO_TICKETS", message: "You hold no cards in this round." };
@@ -226,6 +271,7 @@ async function claimPrizeInner(roomId: string, playerId: string): Promise<ClaimO
     rules: state.rules as PickRules,
     patterns: state.patterns as ClaimPatternDef[],
     closedRules: state.closedRules,
+    rolledRules: state.rolledRules,
     myTickets,
     allTickets,
     called,
@@ -235,7 +281,9 @@ async function claimPrizeInner(roomId: string, playerId: string): Promise<ClaimO
     return {
       claimed: false,
       reason: "NOT_YET",
-      message: pick.best ? `Not yet — ${pick.best.remaining} more for ${pick.best.label}!` : "Not yet — keep tapping!",
+      message: pick.best
+        ? `Not yet — ${pick.best.remaining} more for ${pick.best.label}! Tap them on your card.`
+        : "Not yet — keep tapping!",
       best: pick.best,
     };
   }
