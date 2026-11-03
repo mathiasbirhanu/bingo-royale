@@ -11,10 +11,11 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
 import { toast } from "@/hooks/use-toast";
-import { Wallet, Loader2, BadgeCheck, ArrowDownLeft, ArrowUpRight, Info } from "lucide-react";
+import { Wallet, Loader2, BadgeCheck, ArrowDownLeft, ArrowUpRight, Info, Coins, Smartphone } from "lucide-react";
 import { apiGet, apiPost, etb, newIdempotencyKey, ApiClientError } from "@/lib/client/api";
 import { useApp } from "@/lib/client/store";
 import { usePhase, phaseCopy } from "@/lib/phase";
+import { playSfx } from "@/lib/client/sfx";
 import type { WalletData } from "@/lib/client/types";
 
 const PRESETS = [25, 50, 100, 250];
@@ -83,8 +84,10 @@ export function WalletView() {
 
   return (
     <div className="space-y-4">
-      {/* Balance hero */}
-      <section className="gold-frame rounded-2xl bg-gradient-to-b from-card to-card/60 p-6 text-center space-y-1">
+      {/* Balance hero — coin stack energy */}
+      <section className="gold-frame rounded-2xl bg-gradient-to-b from-card to-card/60 p-6 text-center space-y-1 relative overflow-hidden">
+        <div aria-hidden className="pointer-events-none absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 w-56 h-56 rounded-full bg-[radial-gradient(circle,oklch(0.72_0.14_85/16%),transparent_65%)]" />
+        <Coins aria-hidden className="w-6 h-6 text-primary mx-auto" />
         <p className="text-xs uppercase tracking-widest text-muted-foreground">Wallet balance</p>
         {wallet ? (
           <p className="text-4xl font-black gold-text tabular-nums">{wallet.balanceDisplay} <span className="text-lg">ETB</span></p>
@@ -106,16 +109,16 @@ export function WalletView() {
           {PRESETS.map((p) => (
             <button
               key={p}
-              onClick={() => setSelected(p)}
+              onClick={() => { setSelected(p); playSfx("tap"); }}
               aria-pressed={selected === p}
-              className={`min-h-11 rounded-lg border text-sm font-bold transition-colors ${selected === p ? "border-primary bg-primary/20 text-primary" : "border-border bg-background/40 hover:border-primary/50"}`}
+              className={`min-h-11 rounded-lg border text-sm font-black transition-colors btn-juice ${selected === p ? "border-primary bg-primary/20 text-primary" : "border-border bg-background/40 hover:border-primary/50"}`}
             >
               {p}
             </button>
           ))}
         </div>
-        <Button className="btn-gold w-full font-black min-h-11" disabled={busy} onClick={deposit}>
-          {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : `Deposit ${selected}.00 ETB`}
+        <Button className="btn-gold btn-shine btn-juice w-full font-black min-h-12 text-base" disabled={busy} onClick={deposit}>
+          {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <span className="inline-flex items-center gap-2"><Smartphone className="w-4 h-4" />Deposit {selected}.00 ETB</span>}
         </Button>
         <p className="text-[11px] text-muted-foreground inline-flex items-start gap-1">
           <Info className="w-3 h-3 mt-0.5 flex-none" />
