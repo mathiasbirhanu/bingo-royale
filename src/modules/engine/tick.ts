@@ -7,27 +7,49 @@
  *      (crash-safe: the sequence is a pure function of committed inputs);
  *   2. if the room's ball interval has elapsed, persist the next BallDraw +
  *      emit BALL_CALLED on the outbox (ADR-19 sequence numbers);
- *   3. server-side auto-daub (ADR-20): evaluate every open pattern against
- *      every ticket in the room;
- *   4. any tier with completions pays NOW — split across simultaneous
- *      winners, floor each share (remainder stays in the round), journalised
- *      as one balanced PRIZE transaction, claims CONFIRMED (ADR-16), tier
- *      closes (later claims would be PATTERN_ALREADY_CONFIRMED);
- *   5. completion: all balls drawn or every tier paid → RESOLVING.
+ *   3. award resolution depends on the room's claim mode:
+ *        autoClaim=true  → server-side auto-daub (ADR-20): every open
+ *                          pattern × every ticket, paying tiers NOW;
+ *        autoClaim=false → MANUAL PLAY: nothing auto-pays — players daub and
+ *                          tap BINGO! themselves (engine/claim.ts). The tick
+ *                          only draws balls and watches for completion.
+ *   4. completion: all balls drawn (auto rooms immediately; manual rooms
+ *      after CLAIM_GRACE_MS so last-second claims land) or every tier paid
+ *      → RESOLVING.
  */
 import { db } from "../../lib/db";
-import { emitOutbox, auditTx } from "../../lib/write-path";
+import { emitOutbox } from "../../lib/write-path";
 import { generateDrawSequence, openSealedSeed } from "../game-core/draw";
 import { gridSpec } from "../game-core/variants";
 import { isPatternComplete } from "../game-core/patterns";
-import { tierAmountFor } from "../prize/rulesets";
-import { AccountCodes, postTransaction } from "../ledger";
+import type { PrizeRule } from "../prize/rulesets";
 import type { EngineRoomState } from "./state";
 import { roomState } from "./state";
 import { buildRoomState } from "./lifecycle";
 import { finishRoom } from "./finish";
+import { payTier } from "./pay";
+import { CLAIM_GRACE_MS } from "./claim";
 
 type RoomRow = Awaited<ReturnType<typeof db.room.findUniqueOrThrow>>;
+
+/**
+ * Pure completion decision (unit-tested): a round completes when every tier
+ * paid, or every ball drawn (auto rooms instantly; manual rooms only after
+ * the claim grace window so a last-second BINGO! can still land).
+ */
+export function shouldCompleteRound(args: {
+  allBallsDrawn: boolean;
+  allTiersPaid: boolean;
+  autoClaim: boolean;
+  lastBallCalledAt: number | null;
+  now: number;
+}): boolean {
+  if (args.allTiersPaid) return true;
+  if (!args.allBallsDrawn) return false;
+  if (args.autoClaim) return true;
+  if (args.lastBallCalledAt === null) return true;
+  return args.now - args.lastBallCalledAt >= CLAIM_GRACE_MS;
+}
 
 /** Entry point for a DRAWING room; builds state on first sight (crash-safe). */
 export async function tickDrawing(room: RoomRow): Promise<void> {
@@ -48,16 +70,34 @@ export async function tickDrawing(room: RoomRow): Promise<void> {
   }
 
   const spec = gridSpec(room.variantId);
-  if (state.drawnCount >= spec.ballsTotal) {
+  const allPaid = state.rules.length > 0 && state.closedRules.size >= state.rules.length;
+
+  // Completion check on entry (covers restart-after-last-ball and the manual
+  // grace window without drawing anything).
+  const lastAny = await db.ballDraw.findFirst({ where: { roomId: room.id }, orderBy: { seq: "desc" } });
+  if (
+    shouldCompleteRound({
+      allBallsDrawn: state.drawnCount >= spec.ballsTotal,
+      allTiersPaid: allPaid,
+      autoClaim: room.autoClaim,
+      lastBallCalledAt: lastAny?.calledAt.getTime() ?? null,
+      now: Date.now(),
+    })
+  ) {
     await completeRound(room);
     return;
   }
 
-  const last = await db.ballDraw.findFirst({ where: { roomId: room.id }, orderBy: { seq: "desc" } });
+  // Manual claim grace: the deck is out but the window is still open — the
+  // drum is empty. Never draw past the last ball while waiting for claims.
+  if (state.drawnCount >= spec.ballsTotal) return;
+
+  const last = lastAny;
   const lastAt = last?.calledAt.getTime() ?? room.scheduledAt.getTime();
   if (Date.now() - lastAt < room.ballIntervalMs) return;
 
   const seq = state.drawnCount + 1;
+  if (seq > spec.ballsTotal) return; // defensive: never draw past the deck
   const ball = state.sequence[seq - 1];
 
   await db.$transaction(async (tx) => {
@@ -72,9 +112,20 @@ export async function tickDrawing(room: RoomRow): Promise<void> {
   state.drawnCount = seq;
 
   const called = new Set(state.sequence.slice(0, seq));
-  await resolveAwards(state, room, seq, ball, called);
+  if (room.autoClaim) {
+    await resolveAwards(state, room, seq, ball, called);
+  }
 
-  if (seq >= spec.ballsTotal || (state.rules.length > 0 && state.closedRules.size >= state.rules.length)) {
+  const paidNow = state.rules.length > 0 && state.closedRules.size >= state.rules.length;
+  if (
+    shouldCompleteRound({
+      allBallsDrawn: seq >= spec.ballsTotal,
+      allTiersPaid: paidNow,
+      autoClaim: room.autoClaim,
+      lastBallCalledAt: Date.now(),
+      now: Date.now(),
+    })
+  ) {
     await completeRound(room);
   }
 }
@@ -106,7 +157,8 @@ async function loadTickets(state: EngineRoomState): Promise<void> {
 
 /**
  * Auto-daub award resolution for one ball tick. Sequential per pattern;
- * each paying tier is exactly one balanced journal + one outbox event.
+ * each paying tier is exactly one balanced journal + one outbox event
+ * (the payment core lives in pay.ts — shared with manual BINGO! claims).
  */
 async function resolveAwards(
   state: EngineRoomState,
@@ -131,97 +183,21 @@ async function resolveAwards(
     }
     if (winners.length === 0) continue;
 
-    // Tier amounts always recompute from the room row (FR-PLY-02 live preview
-    // equals engine maths — same function, same inputs).
-    const fresh = await db.room.findUniqueOrThrow({ where: { id: room.id } });
-    const tier = tierAmountFor(rule, fresh.grossSantim, fresh.netPoolSantim);
-    // bigint division truncates toward zero = floor(tier / k): the remainder
-    // of any uneven split stays in the round pool (residual).
-    const each = tier > 0n ? tier / BigInt(winners.length) : 0n;
-    const total = each * BigInt(winners.length);
-
-    await db.$transaction(async (tx) => {
-      const posted =
-        total > 0n
-          ? await postTransaction(tx, {
-              kind: "PRIZE",
-              idempotencyKey: `prize:${room.id}:${pattern.entityId}:${seq}`,
-              memo: `Prize "${pattern.label}" — ${winners.length} winner(s), ball #${ball} @${seq}`,
-              roundId: room.id,
-              tenantId: room.tenantId,
-              entries: [
-                {
-                  accountCode: AccountCodes.roundEscrow(room.id),
-                  accountType: "LIABILITY" as const,
-                  accountName: `Round escrow — ${room.title}`,
-                  direction: "DEBIT",
-                  amount: total,
-                  tenantId: room.tenantId,
-                },
-                ...winners.map((w) => ({
-                  accountCode: AccountCodes.playerWallet(w.playerId),
-                  accountType: "LIABILITY" as const,
-                  accountName: "Player wallet",
-                  direction: "CREDIT" as const,
-                  amount: each,
-                  ownerUserId: w.playerId,
-                })),
-              ],
-            })
-          : null;
-
-      for (const w of winners) {
-        await tx.claim.create({
-          data: {
-            clientClaimId: `auto:${room.id}:${pattern.entityId}:${w.ticketId}`,
-            roomId: room.id,
-            ticketId: w.ticketId,
-            playerId: w.playerId,
-            patternVersionId: pattern.versionId,
-            ballSeq: seq,
-            status: "CONFIRMED",
-            awardSantim: total > 0n ? each : null,
-            journalTxId: posted?.id ?? null,
-            decidedAt: new Date(),
-          },
-        });
-      }
-
-      if (total > 0n) {
-        await tx.room.update({
-          where: { id: room.id },
-          data: { netPoolSantim: fresh.netPoolSantim - total },
-        });
-      }
-
-      await emitOutbox(tx, {
-        type: "AWARDS_RESOLVED",
-        aggregateId: room.id,
-        payload: {
-          roomId: room.id,
-          seq,
-          ball,
-          patternId: pattern.entityId,
-          label: pattern.label,
-          tier: tier.toString(),
-          each: each.toString(),
-          winners: winners.map((w) => ({ playerId: w.playerId, ticketId: w.ticketId, award: each.toString() })),
-        },
-        consumer: "gateway",
-      });
-      await auditTx(tx, {
-        actorId: null,
-        actorRole: "ENGINE",
-        tenantId: room.tenantId,
-        action: "AWARD_CONFIRMED",
-        entityType: "Claim",
-        entityId: `${room.id}:${pattern.entityId}:${seq}`,
-        meta: { ball, seq, winners: winners.length, tier: tier.toString(), each: each.toString() },
-      });
+    const res = await payTier({
+      roomId: room.id,
+      roomTitle: room.title,
+      tenantId: room.tenantId,
+      pattern,
+      rule: rule as PrizeRule,
+      seq,
+      ball,
+      winners,
+      claimKind: "auto",
     });
-
     state.closedRules.add(pattern.entityId);
-    console.log(`[engine] ${room.title} → "${pattern.label}" paid ball #${ball} @${seq} (${winners.length} winner(s))`);
+    console.log(
+      `[engine] ${room.title} → "${pattern.label}" paid ball #${ball} @${seq} (${winners.length} winner(s), ${res.each} each)`
+    );
   }
 }
 
