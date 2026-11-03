@@ -1,0 +1,23 @@
+node_modules/
+.next/
+out/
+build/
+dist/
+
+# env & secrets
+.env
+.env.local
+*.pem
+
+# local data & logs
+*.log
+*.tsbuildinfo
+db/vault/
+db/*.db-journal
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/*
+!.vscode/extensions.json
+.idea/
