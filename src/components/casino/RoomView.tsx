@@ -1,21 +1,25 @@
 "use client";
 
 /**
- * RoomView — the live round, TV-show grade (Bingo-Blitz benchmark):
- *   · caller panel — spinning drum, popping ball, depleting countdown ring,
- *     and the FULL CALLED BOARD side by side with your cards (75-ball: the
- *     classic B-I-N-G-O rows; 90-ball: the 9×10 chart) — everything called
- *     lights up the moment it pops;
- *   · manual play (ADR-20 rooms with autoClaim=false): the card does NOT
- *     touch itself — the player taps each called number, invalid taps buzz
- *     and shake, and when a pattern completes the BINGO! button arms; the
- *     server re-validates every claim against the called set (honest);
- *   · AUTO toggle — one tap back to auto-daub for 2G players who prefer it;
- *   · "n TO GO!" banner — honest by construction: pure card geometry (best
- *     horizontal line across my tickets), never claims the engine's patterns;
- *   · BIG WIN splash — gold title, coin shower, confetti (ADR-16: PROVISIONAL
- *     still shows "checking"; CONFIRMED celebrates) — deduped across the
- *     claim response and the live awards feed (one splash per prize);
+ * RoomView — the live round, TV-show grade (Bingo-Blitz benchmark, brighter):
+ *   · round info bar — the OWNER-SET facts (start time + running clock,
+ *     estimated length, players, card price, caller speed, balls left, live
+ *     prize pool) as vivid glowing chips (FR-PLY-01);
+ *   · pattern strip ABOVE the ball — win-pattern chips with mini diagrams;
+ *     won → gold flash + "WON" stamp + ghost fade; unclaimed past its window
+ *     → "ROLLED →" (its pot flows into the later patterns — owner's rule);
+ *   · ONE ball at a time — a single huge sphere that IS the last server
+ *     event (ball number = called number, one source of truth), no history
+ *     strip for players: the called list and draw order live in the console;
+ *   · CALLING NOW vs BREAK — the state label plus a live countdown, so the
+ *     cadence is visible (next ball in 1.4s / next round in 0:45);
+ *   · PER-CARD manual play (the owner's rule): tapping a number marks THAT
+ *     card only; the same number on another card waits for its own tap;
+ *     uncalled taps buzz red; called-but-undaubed cells glow gold; each card
+ *     carries its own BINGO! button (3s lock after a failed claim) and the
+ *     server re-validates every claim against the called set + the daubs;
+ *   · BIG WIN splash — gold title, coin shower, confetti — deduped across
+ *     the claim response and the live awards feed (one splash per prize);
  *   · PatternGuide popup — the round's actual patterns as dot diagrams;
  *   · live prize table (FR-PLY-02), fairness chip → commitment → reveal.
  * Transport: useRoomLive (socket push → REST sequence catch-up fallback).
@@ -27,18 +31,26 @@ import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
 import { toast } from "@/hooks/use-toast";
 import {
-  Trophy, ShieldCheck, Loader2, ChevronLeft, Lock, Wifi, WifiOff, PartyPopper, Info, Zap, Hand, Sparkles,
-  Clock, Users, Ticket, Coins, Gauge, CircleDot,
+  Trophy, ShieldCheck, Loader2, ChevronLeft, Lock, Wifi, WifiOff, PartyPopper, Info, Sparkles,
+  Clock, Users, Ticket, Coins, Gauge, CircleDot, Timer,
 } from "lucide-react";
 import { apiGet, apiPost, etb, newIdempotencyKey, ApiClientError } from "@/lib/client/api";
 import { useApp } from "@/lib/client/store";
 import { useRoomLive } from "@/lib/client/useRoomLive";
 import { ROOM_STATUS_LABEL, ballClass, type RoomDetail } from "@/lib/client/types";
-import { isPatternComplete } from "@/modules/game-core/patterns";
+import { isPatternComplete, patternWindowSeq } from "@/modules/game-core/patterns";
+import { gridSpec } from "@/modules/game-core/variants";
 import { playSfx } from "@/lib/client/sfx";
 import { BingoCard } from "./BingoCard";
 import { PatternGuide } from "./PatternGuide";
 import { PatternStrip } from "./PatternStrip";
+
+const EMPTY_SET: ReadonlySet<number> = new Set<number>();
+
+const BALL_LETTERS = ["B", "I", "N", "G", "O"];
+function ballLetter(ball: number): string {
+  return BALL_LETTERS[Math.min(4, Math.floor((ball - 1) / 15))];
+}
 
 /** Elapsed seconds since the round started — ticks only while drawing. */
 function useElapsed(fromIso: string | null, active: boolean): number {
@@ -61,9 +73,10 @@ function fmtClock(sec: number): string {
 
 /**
  * RoundInfoBar — the admin-determined round facts, live (FR-PLY-01):
- * start time + running clock, players in the round, card price, caller
- * speed, balls called/left and the growing prize pool. Every number here is
- * owner-tuned (price/speed in the console) or engine-truth — no local maths.
+ * start time + running clock, estimated round length, players in the round,
+ * card price, caller speed, balls called/left and the growing prize pool.
+ * Every number here is owner-tuned (price/speed in the console) or engine
+ * truth — no local maths.
  */
 function RoundInfoBar({
   detail,
@@ -83,33 +96,36 @@ function RoundInfoBar({
   const elapsed = useElapsed(started ? detail.scheduledAt : null, drawing);
   const total = ballsTotal ?? null;
   const left = total !== null ? Math.max(0, total - calledCount) : null;
+  // Estimated round length — owner-tuned speed × deck size (display only).
+  const estMin = total !== null ? Math.max(1, Math.round((total * intervalMs) / 60_000)) : null;
 
   const chips: Array<{ icon: ReactNode; label: string; value: string; hue: string }> = [
-    { icon: <Clock className="w-3.5 h-3.5" />, label: started ? "Started" : "Starts", value: drawing ? `${startLabel} · ${fmtClock(elapsed)}` : startLabel, hue: "oklch(0.78 0.15 200)" },
-    { icon: <Users className="w-3.5 h-3.5" />, label: "Players", value: String(detail.players), hue: "oklch(0.78 0.17 155)" },
-    { icon: <Ticket className="w-3.5 h-3.5" />, label: "Card", value: `${etb(detail.priceSantim)} ETB`, hue: "oklch(0.84 0.17 88)" },
-    { icon: <Gauge className="w-3.5 h-3.5" />, label: "Speed", value: `${(intervalMs / 1000).toFixed(1)}s/ball`, hue: "oklch(0.72 0.19 35)" },
+    { icon: <Clock className="w-3.5 h-3.5" />, label: started ? "Started" : "Starts", value: drawing ? `${startLabel} · ${fmtClock(elapsed)}` : startLabel, hue: "oklch(0.82 0.16 200)" },
+    ...(estMin !== null ? [{ icon: <Timer className="w-3.5 h-3.5" />, label: "Length", value: `~${estMin} min`, hue: "oklch(0.8 0.14 260)" }] : []),
+    { icon: <Users className="w-3.5 h-3.5" />, label: "Players", value: String(detail.players), hue: "oklch(0.84 0.18 150)" },
+    { icon: <Ticket className="w-3.5 h-3.5" />, label: "Card", value: `${etb(detail.priceSantim)} ETB`, hue: "oklch(0.88 0.17 92)" },
+    { icon: <Gauge className="w-3.5 h-3.5" />, label: "Speed", value: `${(intervalMs / 1000).toFixed(1)}s/ball`, hue: "oklch(0.78 0.19 35)" },
     {
       icon: <CircleDot className="w-3.5 h-3.5" />,
       label: total !== null ? "Balls" : "Called",
       value: total !== null ? (drawing ? `${calledCount}/${total} · ${left} left` : `${calledCount}/${total}`) : String(calledCount),
-      hue: "oklch(0.72 0.19 320)",
+      hue: "oklch(0.78 0.19 330)",
     },
-    { icon: <Coins className="w-3.5 h-3.5" />, label: "Prize pool", value: `${etb(detail.netPoolSantim)} ETB`, hue: "oklch(0.8 0.14 70)" },
+    { icon: <Coins className="w-3.5 h-3.5" />, label: "Prize pool", value: `${etb(detail.netPoolSantim)} ETB`, hue: "oklch(0.85 0.15 75)" },
   ];
 
   return (
-    <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-1.5" role="group" aria-label="Round information">
+    <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-1.5" role="group" aria-label="Round information">
       {chips.map((c) => (
         <div
           key={c.label}
           className="info-chip rounded-xl px-2.5 py-1.5 flex items-center gap-2 min-w-0"
           style={{ "--ic": c.hue } as CSSProperties}
         >
-          <span className="text-[--ic] flex-none" style={{ color: c.hue }}>{c.icon}</span>
+          <span className="flex-none" style={{ color: c.hue }}>{c.icon}</span>
           <span className="min-w-0">
             <span className="block text-[9px] uppercase tracking-wider text-muted-foreground font-bold leading-none">{c.label}</span>
-            <span className="block text-[12px] font-black tabular-nums truncate leading-tight" style={{ color: c.hue }}>{c.value}</span>
+            <span className="block text-[12px] font-black tabular-nums truncate leading-tight" style={{ color: c.hue, textShadow: `0 0 12px ${c.hue}55` }}>{c.value}</span>
           </span>
         </div>
       ))}
@@ -117,106 +133,124 @@ function RoundInfoBar({
   );
 }
 
+/**
+ * BallStage — ONE ball at a time (the owner's rule). The sphere renders the
+ * LAST server event verbatim — `balls[last].ball` — so the number in the
+ * ball is always exactly the number that was called. No history strip, no
+ * local clock number: the full list lives in the admin console only.
+ */
 function BallStage({
-  balls,
+  lastBall,
   nextBallInMs,
   intervalMs,
   status,
+  scheduledAtIso,
+  is75,
   toGo,
   hasTickets,
 }: {
-  balls: Array<{ seq: number; ball: number }>;
+  lastBall: { seq: number; ball: number } | null;
   nextBallInMs: number | null;
   intervalMs: number;
   status: string;
+  scheduledAtIso: string;
+  is75: boolean;
   toGo: number;
   hasTickets: boolean;
 }) {
-  const last = balls[balls.length - 1] ?? null;
-  const prev = balls.slice(-5, -1).reverse(); // exactly 4 ghosts — history lives in the admin console
+  const drawing = status === "DRAWING";
+  const onAir = drawing || status === "SALES_OPEN" || status === "LOCKED";
   // Countdown as derived state: a deadline memo (recomputed only when the
-  // server cadence changes) minus a 100ms clock — no sync setState effects.
+  // server cadence changes) minus a 200ms clock — no sync setState effects.
   const deadline = useMemo(() => (nextBallInMs === null ? null : Date.now() + nextBallInMs), [nextBallInMs]);
   const [now, setNow] = useState(() => Date.now());
 
   useEffect(() => {
-    if (status !== "DRAWING") return;
-    const t = setInterval(() => setNow(Date.now()), 100);
+    if (!onAir) return;
+    const t = setInterval(() => setNow(Date.now()), 200);
     return () => clearInterval(t);
-  }, [status]);
+  }, [onAir]);
   const eta = deadline === null ? null : Math.max(0, deadline - now);
+
+  // BREAK countdown: time to the next round's first ball (local clock, display only).
+  const breakLeftMs = !drawing && (status === "SALES_OPEN" || status === "LOCKED")
+    ? Math.max(0, new Date(scheduledAtIso).getTime() - now)
+    : null;
 
   // Depleting ring: full at the start of the interval, empty at the pop.
   const R = 84;
   const C = 2 * Math.PI * R;
-  const progress = status === "DRAWING" && eta !== null ? Math.min(1, Math.max(0, eta / Math.max(1, intervalMs))) : 0;
-  const drawing = status === "DRAWING";
+  const progress = drawing && eta !== null ? Math.min(1, Math.max(0, eta / Math.max(1, intervalMs))) : 0;
+
+  const stateLabel = drawing
+    ? "CALLING NOW"
+    : status === "SALES_OPEN"
+      ? "BREAK · CARDS ON SALE"
+      : status === "LOCKED"
+        ? "GET READY"
+        : (ROOM_STATUS_LABEL[status] ?? status);
 
   return (
-    <section className="gold-frame rounded-2xl bg-card/85 p-3 space-y-2.5">
-      {/* Drum + live strip — side by side */}
-      <div className="flex items-center gap-3">
-        <div className="relative w-28 h-28 flex-none" role="img" aria-label={last ? `Last ball: ${last.ball}` : "Waiting for the first ball"}>
-          <svg viewBox="0 0 200 200" className="absolute inset-0 w-full h-full -rotate-90" aria-hidden>
-            <circle cx="100" cy="100" r={R} fill="none" stroke="oklch(1 0 0 / 7%)" strokeWidth="10" />
-            <circle
-              cx="100" cy="100" r={R} fill="none" stroke="var(--gold)" strokeWidth="10" strokeLinecap="round"
-              strokeDasharray={C} strokeDashoffset={C * (1 - progress)}
-              style={{ transition: "stroke-dashoffset 0.12s linear", filter: "drop-shadow(0 0 6px oklch(0.8 0.15 88 / 60%))" }}
-            />
-          </svg>
-          <div aria-hidden className="stage-ring absolute inset-[9px] rounded-full" />
-          <div className="absolute inset-0 grid place-items-center">
-            {last ? (
-              <span key={last.seq} className={`ball-stage ball-sphere ${ballClass(last.ball)} w-[4.5rem] h-[4.5rem] text-4xl ${drawing ? "ball-pop" : ""}`}>
-                {last.ball}
-              </span>
-            ) : (
-              <span className="ball-stage w-16 h-16 rounded-full grid place-items-center text-center px-2">
-                <span className="text-[8px] uppercase tracking-widest text-primary/80 font-bold">
-                  {status === "SALES_OPEN" ? "buy & wait" : "…"}
-                </span>
-              </span>
-            )}
-          </div>
-        </div>
+    <section className="gold-frame rounded-2xl bg-card/85 p-3 space-y-3">
+      {/* Status line — CALLING NOW vs BREAK, with the live countdown */}
+      <div className="flex items-center justify-between gap-2">
+        <Badge className={drawing ? "bg-accent text-accent-foreground gap-1.5 font-black tracking-wide" : "bg-secondary text-secondary-foreground font-bold tracking-wide"}>
+          {drawing && <span className="live-dot inline-block w-1.5 h-1.5 rounded-full bg-white" />}
+          {stateLabel}
+        </Badge>
+        <span className="text-[11px] font-bold text-muted-foreground tabular-nums whitespace-nowrap" role="status" aria-live="off">
+          {drawing
+            ? eta !== null && eta <= 0
+              ? "popping now…"
+              : `next ball in ${((eta ?? intervalMs) / 1000).toFixed(1)}s`
+            : breakLeftMs !== null
+              ? `next round in ${fmtClock(Math.ceil(breakLeftMs / 1000))}`
+              : ""}
+        </span>
+      </div>
 
-        <div className="min-w-0 flex-1 space-y-2">
-          <div className="flex items-center justify-between gap-2">
-            <Badge className={drawing ? "bg-accent text-accent-foreground gap-1.5 font-black" : "bg-secondary text-secondary-foreground"}>
-              {drawing && <span className="live-dot inline-block w-1.5 h-1.5 rounded-full bg-white" />}
-              {ROOM_STATUS_LABEL[status] ?? status}
-            </Badge>
-            {drawing && (
-              <span className="text-[11px] text-muted-foreground tabular-nums whitespace-nowrap">
-                {eta !== null && eta <= 0 ? "popping now…" : `next in ${((eta ?? intervalMs) / 1000).toFixed(1)}s`}
+      {/* The single ball — bigger than life, number = called number */}
+      <div className="relative mx-auto w-44 h-44" role="img" aria-label={lastBall ? (is75 ? `Ball called: ${ballLetter(lastBall.ball)} ${lastBall.ball}` : `Ball called: ${lastBall.ball}`) : "Waiting for the first ball"}>
+        <svg viewBox="0 0 200 200" className="absolute inset-0 w-full h-full -rotate-90" aria-hidden>
+          <circle cx="100" cy="100" r={R} fill="none" stroke="oklch(1 0 0 / 7%)" strokeWidth="10" />
+          <circle
+            cx="100" cy="100" r={R} fill="none" stroke="var(--gold)" strokeWidth="10" strokeLinecap="round"
+            strokeDasharray={C} strokeDashoffset={C * (1 - progress)}
+            style={{ transition: "stroke-dashoffset 0.12s linear", filter: "drop-shadow(0 0 6px oklch(0.8 0.15 88 / 60%))" }}
+          />
+        </svg>
+        <div aria-hidden className="stage-ring absolute inset-[9px] rounded-full" />
+        <div className="absolute inset-0 grid place-items-center">
+          {lastBall ? (
+            <span
+              key={lastBall.seq}
+              className={`ball-stage ball-sphere ${ballClass(lastBall.ball)} w-32 h-32 flex-col ${drawing ? "ball-pop" : ""}`}
+            >
+              {is75 && <span className="ball-letter">{ballLetter(lastBall.ball)}</span>}
+              <span className="text-5xl font-black leading-none tabular-nums">{lastBall.ball}</span>
+              <span className="text-[8px] uppercase tracking-[0.2em] opacity-70 mt-0.5">called</span>
+            </span>
+          ) : (
+            <span className="ball-stage w-24 h-24 rounded-full grid place-items-center text-center px-2">
+              <span className="text-[9px] uppercase tracking-widest text-primary/80 font-bold">
+                {status === "SALES_OPEN" ? "buy & wait" : "…"}
               </span>
-            )}
-          </div>
-
-          {/* One ball at a time — the four before it as fading ghosts. The
-              full called list and the draw order live in the admin console. */}
-          <div className="flex items-center gap-1.5 flex-wrap">
-            {prev.map((b, i) => (
-              <span
-                key={b.seq}
-                className={`ball-sphere ${ballClass(b.ball)} w-8 h-8 text-xs ${drawing ? "ball-pop" : ""}`}
-                style={{ opacity: 1 - i * 0.22, ...(drawing ? { animationDelay: `${(prev.length - i) * 0.04}s` } : {}) }}
-              >
-                {b.ball}
-              </span>
-            ))}
-            {prev.length === 0 && <span className="text-[11px] text-muted-foreground">the drum is warming up…</span>}
-          </div>
-
-          {/* n TO GO — honest geometry: best horizontal line across my tickets */}
-          {drawing && hasTickets && toGo >= 1 && toGo <= 3 && (
-            <div className={`to-go rounded-lg text-center py-1.5 font-black tracking-wide ${toGo === 1 ? "text-base" : "text-sm"}`} role="status" aria-live="polite">
-              {toGo === 1 ? "⚡ 1 TO GO — BEST LINE!" : `${toGo} TO GO · BEST LINE`}
-            </div>
+            </span>
           )}
         </div>
       </div>
+      {lastBall && (
+        <p className="text-center text-[10px] text-muted-foreground">
+          ball #{lastBall.seq} of {is75 ? "75" : "90"} — one number at a time
+        </p>
+      )}
+
+      {/* n TO GO — honest geometry: best horizontal line across my tickets */}
+      {drawing && hasTickets && toGo >= 1 && toGo <= 3 && (
+        <div className={`to-go rounded-lg text-center py-1.5 font-black tracking-wide ${toGo === 1 ? "text-base" : "text-sm"}`} role="status" aria-live="polite">
+          {toGo === 1 ? "⚡ 1 TO GO — BEST LINE!" : `${toGo} TO GO · BEST LINE`}
+        </div>
+      )}
     </section>
   );
 }
@@ -250,92 +284,68 @@ export function RoomView({ roomId, onBack }: { roomId: string; onBack: () => voi
   const calledSet = useMemo(() => new Set(live.balls.map((b) => b.ball)), [live.balls]);
   const lastBall = live.balls.length ? live.balls[live.balls.length - 1] : null;
 
-  const manual = detail ? !detail.autoClaim : false; // manual = tap + BINGO!
+  // Manual play is THE game (owner's rule): nothing ever marks itself. An
+  // admin-flipped auto hall keeps paying server-side; its cards then just
+  // display the called marks read-only (no BINGO! button).
+  const manual = detail ? !detail.autoClaim : false;
+  const interactive = manual && live.status === "DRAWING";
   const [guideOpen, setGuideOpen] = useState(false);
 
-  // ---------------------------------------------------------------- daub mode
-  // null = not chosen yet → follow the hall's mode (manual halls start manual).
-  const [daubMode, setDaubMode] = useState<"auto" | "manual" | null>(null);
-  useEffect(() => {
-    try {
-      const pref = localStorage.getItem("bingo.daub");
-      if (pref === "auto" || pref === "manual") setDaubMode(pref);
-    } catch {
-      /* private mode — session default */
-    }
-  }, []);
-  const autoDaub = daubMode === null ? detail ? detail.autoClaim : true : daubMode === "auto";
-  const chooseDaubMode = (mode: "auto" | "manual") => {
-    setDaubMode(mode);
-    try {
-      localStorage.setItem("bingo.daub", mode);
-    } catch {
-      /* session-only */
-    }
-    playSfx("tap");
-  };
+  // ── Per-card daubs (the correction) ─────────────────────────────────────
+  // One INDEPENDENT set per card: tapping "I-22" on card 1 never touches
+  // card 2. The player must find the number on every card they own.
+  const [daubs, setDaubs] = useState<Record<string, Set<number>>>({});
+  const [fresh, setFresh] = useState<{ ticketId: string; n: number } | null>(null);
+  const [shakes, setShakes] = useState<Record<string, { n: number; k: number } | null>>({});
 
-  // My daubs — the ball numbers I tapped (manual) or the server caught up for
-  // me (auto). On reconnect the already-called numbers are marked instantly
-  // (fair catch-up); only live balls demand taps.
-  const [daubed, setDaubed] = useState<Set<number>>(new Set());
-  const caughtUpRef = useRef(false);
+  // Fair catch-up, once per room: numbers called before the player opened
+  // the room are pre-marked on every card (they weren't there to tap).
+  const caughtUpRef = useRef<string | null>(null);
   useEffect(() => {
-    setDaubed(new Set());
-    caughtUpRef.current = false;
-  }, [roomId]);
-  useEffect(() => {
-    if (autoDaub) {
-      caughtUpRef.current = false;
-      setDaubed(calledSet);
-      return;
-    }
-    if (!caughtUpRef.current) {
-      caughtUpRef.current = true;
-      setDaubed(calledSet);
-    }
-  }, [autoDaub, calledSet]);
+    if (!detail || caughtUpRef.current === roomId) return;
+    caughtUpRef.current = roomId;
+    setDaubs(() => {
+      const next: Record<string, Set<number>> = {};
+      for (const t of detail.myTickets) {
+        const s = new Set<number>();
+        for (const row of t.numbers) for (const n of row) if (n !== null && calledSet.has(n)) s.add(n);
+        next[t.ticketId] = s;
+      }
+      return next;
+    });
+  }, [detail, roomId, calledSet]);
 
-  const [freshTap, setFreshTap] = useState<number | null>(null);
-  const [shake, setShake] = useState<{ n: number; k: number } | null>(null);
-  const tapCell = (n: number) => {
-    if (daubed.has(n)) return;
+  const tapCell = (ticketId: string, n: number) => {
+    if ((daubs[ticketId] ?? EMPTY_SET).has(n)) return;
     if (calledSet.has(n)) {
-      const next = new Set(daubed);
-      next.add(n);
-      setDaubed(next);
-      setFreshTap(n);
+      setDaubs((prev) => ({ ...prev, [ticketId]: new Set(prev[ticketId]).add(n) }));
+      setFresh({ ticketId, n });
       playSfx("daub");
     } else {
+      // Not called yet: red buzz-shake on THIS card, nothing marked.
       playSfx("error");
-      setShake((s) => ({ n, k: (s?.k ?? 0) + 1 }));
+      setShakes((prev) => ({ ...prev, [ticketId]: { n, k: (prev[ticketId]?.k ?? 0) + 1 } }));
     }
   };
 
-  const markedSet = autoDaub ? calledSet : daubed;
-  const freshBall = autoDaub ? (lastBall?.ball ?? null) : freshTap;
+  const markedFor = useCallback(
+    (ticketId: string): ReadonlySet<number> => (manual ? daubs[ticketId] ?? EMPTY_SET : calledSet),
+    [manual, daubs, calledSet]
+  );
 
   // My confirmed wins in this room — award winners carry the player id on
   // both transports (REST catch-up + socket), so ownership is client-side.
   const myWins = live.awards.filter((a) => a.winners.some((w) => w[2] === user?.id));
   const anyWin = live.awards.length > 0;
 
-  // Ball pop sound — fires once per new ball (seq-guarded). The auto-daub hit
-  // sound only rings in auto mode; manual players hear it from their own taps.
+  // Ball pop sound — fires once per new ball (seq-guarded).
   const prevSeqRef = useRef<number | null>(null);
   useEffect(() => {
     if (lastBall && lastBall.seq !== prevSeqRef.current) {
       prevSeqRef.current = lastBall.seq;
       playSfx("ball");
-      if (autoDaub) {
-        const mine = detail?.myTickets.some((t) => t.numbers.some((row) => row.some((n) => n === lastBall.ball)));
-        if (mine) {
-          const t = setTimeout(() => playSfx("daub"), 260);
-          return () => clearTimeout(t);
-        }
-      }
     }
-  }, [lastBall, detail, autoDaub]);
+  }, [lastBall]);
 
   // Honest "best line" to-go: remaining cells on the closest horizontal row
   // across all my tickets (pure geometry — does not guess tenant patterns).
@@ -350,23 +360,41 @@ export function RoomView({ roomId, onBack }: { roomId: string; onBack: () => voi
     return best;
   }, [detail?.myTickets, calledSet]);
 
-  // ------------------------------------------------------------- BINGO! claim
-  const canBingo = useMemo(() => {
-    if (!manual || !detail || !markedSet || markedSet.size === 0) return false;
-    if (live.status !== "DRAWING") return false;
+  // ── BINGO! claims — armed PER CARD, with the roll-up windows ────────────
+  // Open patterns: not paid, and their claim window hasn't passed (the same
+  // pure window function the engine enforces — unclaimed pots roll up).
+  const openPatterns = useMemo(() => {
+    if (!detail) return [];
+    const total = live.ballsTotal ?? gridSpec(detail.variantId).ballsTotal;
+    const won = new Set(live.awards.map((a) => a.label));
+    return detail.patterns.filter(
+      (p, i) => !won.has(p.label) && live.balls.length <= patternWindowSeq(total, i, detail.patterns.length)
+    );
+  }, [detail, live.awards, live.ballsTotal, live.balls.length]);
+
+  // A card's BINGO! button arms when THAT card's own daubs complete an open
+  // pattern — never another card's marks (daubs ⊆ called by construction).
+  const readyTicketIds = useMemo(() => {
+    const out = new Set<string>();
+    if (!manual || !detail || live.status !== "DRAWING") return out;
     for (const t of detail.myTickets) {
-      for (const p of detail.patterns) {
-        if (isPatternComplete(detail.variantId, t.numbers, markedSet, p.payload).complete) return true;
+      const marked = daubs[t.ticketId] ?? EMPTY_SET;
+      for (const p of openPatterns) {
+        if (isPatternComplete(detail.variantId, t.numbers, marked, p.payload).complete) {
+          out.add(t.ticketId);
+          break;
+        }
       }
     }
-    return false;
-  }, [manual, detail, markedSet, live.status]);
+    return out;
+  }, [manual, detail, live.status, daubs, openPatterns]);
 
   const wasReadyRef = useRef(false);
   useEffect(() => {
-    if (canBingo && !wasReadyRef.current) playSfx("ready");
-    wasReadyRef.current = canBingo;
-  }, [canBingo]);
+    const anyReady = readyTicketIds.size > 0;
+    if (anyReady && !wasReadyRef.current) playSfx("ready");
+    wasReadyRef.current = anyReady;
+  }, [readyTicketIds]);
 
   // One splash per prize — the claim response and the live awards feed can
   // both announce the same tier; the key set keeps the TV moment singular.
@@ -398,21 +426,37 @@ export function RoomView({ roomId, onBack }: { roomId: string; onBack: () => voi
     }
   }, [myWins, user?.id, showSplash]);
 
-  const [claiming, setClaiming] = useState(false);
-  const claim = async () => {
-    if (claiming) return;
-    setClaiming(true);
+  // ── Claim per card: server validates daubs + called set; a failed claim
+  // flashes "NOT YET!" on that card and locks its button for 3 seconds.
+  const [claimingId, setClaimingId] = useState<string | null>(null);
+  const [locks, setLocks] = useState<Record<string, number>>({});
+  const [notYetId, setNotYetId] = useState<string | null>(null);
+  const notYetTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => { if (notYetTimer.current) clearTimeout(notYetTimer.current); }, []);
+
+  const claim = async (ticketId: string) => {
+    if (!detail || claimingId || (locks[ticketId] ?? 0) > Date.now()) return;
+    setClaimingId(ticketId);
     playSfx("tap");
     try {
       const res = await apiPost<{ claimed: boolean; reason?: string; message?: string; label?: string; eachSantim?: string; ballSeq?: number }>(
         `/api/v1/rooms/${roomId}/claim`,
-        {}
+        {
+          daubs: detail.myTickets.map((t) => ({
+            ticketId: t.ticketId,
+            numbers: [...(daubs[t.ticketId] ?? EMPTY_SET)],
+          })),
+        }
       );
       if (res.claimed) {
         showSplash(res.label ?? "BINGO!", etb(res.eachSantim ?? "0"), `${res.ballSeq ?? 0}|${res.label ?? "BINGO!"}`);
         toast({ title: "BINGO! confirmed 🎉", description: `${res.label} — prize credited instantly.` });
       } else {
         playSfx("error");
+        setNotYetId(ticketId);
+        setLocks((prev) => ({ ...prev, [ticketId]: Date.now() + 3000 }));
+        if (notYetTimer.current) clearTimeout(notYetTimer.current);
+        notYetTimer.current = setTimeout(() => setNotYetId((cur) => (cur === ticketId ? null : cur)), 1400);
         toast({
           title: res.reason === "NOT_YET" ? "Not yet!" : (res.reason ?? "NOT_YET"),
           description: res.message ?? "Keep tapping the called numbers on your card.",
@@ -426,7 +470,7 @@ export function RoomView({ roomId, onBack }: { roomId: string; onBack: () => voi
         variant: "destructive",
       });
     } finally {
-      setClaiming(false);
+      setClaimingId(null);
     }
   };
 
@@ -540,7 +584,7 @@ export function RoomView({ roomId, onBack }: { roomId: string; onBack: () => voi
         <span className="text-xs text-muted-foreground whitespace-nowrap">{etb(detail.priceSantim)} ETB / card</span>
       </div>
 
-      {/* Round facts — start time, players, price, speed, balls, pool (owner-set) */}
+      {/* Round facts — start time, length, players, price, speed, balls, pool (owner-set) */}
       <RoundInfoBar
         detail={detail}
         intervalMs={intervalMs}
@@ -549,20 +593,25 @@ export function RoomView({ roomId, onBack }: { roomId: string; onBack: () => voi
         drawing={live.status === "DRAWING"}
       />
 
-      {/* The winning patterns — always visible ABOVE the caller, fade when won */}
+      {/* The winning patterns — always visible ABOVE the ball; won ones fade,
+          unclaimed-expired ones roll up into the pool */}
       <PatternStrip
         variantId={detail.variantId}
         patterns={detail.patterns}
         prizeTable={detail.prizeTable}
         awards={live.awards}
         status={live.status}
+        calledCount={live.balls.length}
+        ballsTotal={live.ballsTotal}
       />
 
       <BallStage
-        balls={live.balls}
+        lastBall={lastBall}
         nextBallInMs={live.nextBallInMs}
         intervalMs={intervalMs}
         status={live.status}
+        scheduledAtIso={detail.scheduledAt}
+        is75={detail.variantId === "BALL_75"}
         toGo={toGo}
         hasTickets={detail.myTickets.length > 0}
       />
@@ -575,34 +624,52 @@ export function RoomView({ roomId, onBack }: { roomId: string; onBack: () => voi
         </div>
       )}
 
-      {/* My cards — the playing area: cards sit right under the caller board */}
+      {/* My cards — side by side, each with its own independent daubs and
+          its own BINGO! button (manual = the game; auto halls display marks) */}
       {detail.myTickets.length > 0 && (
         <section className="space-y-2">
           <div className="flex items-center justify-between px-1">
             <h3 className="text-sm font-bold">
               My cards ({detail.myTickets.length}){" "}
               <span className="font-normal text-muted-foreground">
-                — {autoDaub ? "auto-daubed for you" : "tap the called numbers!"}
+                {manual ? "— find & tap each number on every card!" : "— auto-paying hall"}
               </span>
             </h3>
-            {manual && live.status === "DRAWING" && !autoDaub && (
+            {interactive && (
               <span className="text-[10px] font-bold text-accent-foreground bg-accent/20 border border-accent/50 rounded-full px-2 py-0.5">MANUAL</span>
             )}
           </div>
           <div className="grid sm:grid-cols-2 gap-3">
-            {detail.myTickets.map((t) => (
+            {detail.myTickets.map((t, idx) => (
               <BingoCard
                 key={t.ticketId}
                 cells={t.numbers}
                 variantId={detail.variantId}
-                marked={markedSet}
-                freshBall={freshBall}
-                interactive={manual && !autoDaub && live.status === "DRAWING"}
-                onTapCell={tapCell}
-                shake={shake}
+                called={calledSet}
+                daubed={markedFor(t.ticketId)}
+                fresh={
+                  manual
+                    ? (fresh && fresh.ticketId === t.ticketId ? fresh.n : null)
+                    : (lastBall?.ball ?? null)
+                }
+                interactive={interactive}
+                onTapCell={(n) => tapCell(t.ticketId, n)}
+                shake={manual ? shakes[t.ticketId] ?? null : null}
+                showBingo={manual && live.status === "DRAWING" && !finished}
+                bingo={readyTicketIds.has(t.ticketId)}
+                claiming={claimingId === t.ticketId}
+                lockUntil={locks[t.ticketId] ?? null}
+                notYet={notYetId === t.ticketId}
+                onClaim={() => void claim(t.ticketId)}
+                compact={detail.myTickets.length > 2 && idx >= 2}
               />
             ))}
           </div>
+          {manual && live.status === "DRAWING" && (
+            <p className="text-center text-[11px] font-semibold text-accent-foreground bg-background/70 backdrop-blur-sm rounded-lg py-1 px-2 border border-accent/30">
+              Tap the called numbers on every card — each card is marked separately. Then hit BINGO! on the lucky one.
+            </p>
+          )}
         </section>
       )}
 
@@ -650,7 +717,7 @@ export function RoomView({ roomId, onBack }: { roomId: string; onBack: () => voi
               <div key={row.patternId} className={`flex items-center justify-between rounded-lg px-3 py-2 text-sm ${paidRow ? "bg-primary/10 line-through decoration-primary/60" : "bg-background/40"}`}>
                 <span className="font-semibold">{row.patternLabel}</span>
                 {/* Paid tiers freeze at the amount actually awarded; open tiers
-                    track the live pool (FR-PLY-02). */}
+                    track the live pool (FR-PLY-02) — including roll-up boosts. */}
                 <span className={`font-bold tabular-nums ${paidRow ? "text-primary" : ""}`}>
                   {paidRow ? paidRow.winners.map((w) => w[1]).join(" / ") : etb(row.tierSantim)}
                   <span className="text-[10px] font-normal text-muted-foreground"> ETB</span>
@@ -659,7 +726,9 @@ export function RoomView({ roomId, onBack }: { roomId: string; onBack: () => voi
             );
           })}
         </div>
-        <p className="text-[11px] text-muted-foreground">Pool grows with every confirmed sale. Simultaneous winners split the tier evenly; the floor remainder stays in the round.</p>
+        <p className="text-[11px] text-muted-foreground">
+          Pool grows with every confirmed sale. Simultaneous winners split the tier evenly. A pattern unclaimed when its window closes rolls its prize into the next pots.
+        </p>
       </section>
 
       {/* Winners feed */}
@@ -687,8 +756,8 @@ export function RoomView({ roomId, onBack }: { roomId: string; onBack: () => voi
           {!finished ? (
             <p>
               Fairness commitment is published at lock and verifiable on completion.
-              The draw sequence is fixed before the first ball and cannot change.
-              {manual ? " Claims are checked against the called balls — a valid BINGO! always pays." : ""}
+              The draw sequence is fixed before the first ball and cannot change — every number appears exactly once.
+              {manual ? " Claims are checked against the called balls and your own daubs — a valid BINGO! always pays." : ""}
             </p>
           ) : reveal ? (
             <details>
@@ -704,43 +773,6 @@ export function RoomView({ roomId, onBack }: { roomId: string; onBack: () => voi
           )}
         </div>
       </section>
-
-      {/* BINGO! bar — manual halls: claim is yours to tap (sticky above the nav) */}
-      {manual && detail.myTickets.length > 0 && !finished && (
-        <div className="sticky bottom-[60px] z-40 pt-1">
-          <div className="gold-frame rounded-2xl bg-card/90 backdrop-blur-md p-2 flex items-center gap-2 shadow-[0_8px_24px_oklch(0_0_0/35%)]">
-            <button
-              aria-label="How to win"
-              onClick={() => { playSfx("tap"); setGuideOpen(true); }}
-              className="w-11 h-11 grid place-items-center rounded-xl border border-primary/40 text-primary flex-none"
-            >
-              <Info className="w-5 h-5" />
-            </button>
-            <button
-              onClick={() => chooseDaubMode(autoDaub ? "manual" : "auto")}
-              aria-pressed={!autoDaub}
-              aria-label={autoDaub ? "Switch to manual daubing" : "Switch to auto daubing"}
-              className={`w-11 h-11 grid place-items-center rounded-xl border flex-none ${autoDaub ? "border-emerald-600/60 text-emerald-500" : "border-accent/60 text-accent-foreground"}`}
-            >
-              {autoDaub ? <Zap className="w-5 h-5" /> : <Hand className="w-5 h-5" />}
-            </button>
-            <button
-              disabled={!canBingo || claiming}
-              onClick={claim}
-              aria-live="polite"
-              className={`flex-1 min-h-12 rounded-xl font-black text-xl tracking-widest btn-juice transition-all
-                ${canBingo ? "bingo-ready bg-accent text-accent-foreground cursor-pointer" : "bg-secondary/60 text-muted-foreground cursor-not-allowed"}`}
-            >
-              {claiming ? <Loader2 className="w-5 h-5 animate-spin inline" /> : canBingo ? "⚡ BINGO!" : "BINGO!"}
-            </button>
-          </div>
-          {manual && live.status === "DRAWING" && !autoDaub && !canBingo && (
-            <p className="mt-1 text-center text-[11px] font-semibold text-accent-foreground bg-background/85 backdrop-blur-sm rounded-lg py-1 px-2 border border-accent/30">
-              Tap the called numbers on your card — then hit BINGO!
-            </p>
-          )}
-        </div>
-      )}
 
       <PatternGuide open={guideOpen} onOpenChange={setGuideOpen} patterns={detail.patterns} variantId={detail.variantId} />
     </div>
